@@ -1,0 +1,17 @@
+[package]
+name = "orangedb"
+description = "Typed entities with foreign keys and unique indexes on top of redb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orangedb-macros.workspace = true
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+redb = { version = "4.4", features = ["uuid"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+uuid = { version = "1.18", features = ["v7", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
