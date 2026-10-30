@@ -6,7 +6,7 @@ use std::path::Path;
 use orangedb::Error;
 use orangedb::redb::{ReadableDatabase, TableDefinition};
 
-use crate::example::blog::{self, Post, Reply, User, UserId};
+use crate::blog::schema::{self as blog, Post, Reply, User, UserId};
 
 fn alice() -> User {
     User {

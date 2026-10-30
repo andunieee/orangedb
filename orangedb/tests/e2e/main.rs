@@ -36,11 +36,6 @@ macro_rules! backends {
     )*};
 }
 
-/// The example itself, so the blog tests run against its exact schema.
-#[path = "../../examples/blog.rs"]
-#[allow(dead_code)]
-mod example;
-
 mod blog;
 mod keys;
 mod persistence;

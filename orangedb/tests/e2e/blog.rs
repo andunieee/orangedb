@@ -1,9 +1,55 @@
-//! The schema from `examples/blog.rs`, driven through its story and the
-//! corners around it.
+//! A small blog: users write posts, and replies thread under posts and under
+//! each other. `walkthrough` tells its story; the rest cover the corners
+//! around it.
 
 use orangedb::Error;
 
-use crate::example::blog::*;
+#[orangedb::schema]
+pub mod schema {
+    #[entity]
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct User {
+        #[id(auto)]
+        pub id: UserId,
+        #[unique]
+        pub email: String,
+        pub name: String,
+    }
+
+    #[entity]
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Post {
+        #[id(uuid)]
+        pub id: PostId,
+        /// Deleting a user deletes their posts.
+        #[references(User, on_delete = cascade)]
+        pub author: UserId,
+        pub title: String,
+        /// Deleting a user removes them from the posts they liked.
+        #[references(User, on_delete = set_null)]
+        pub liked_by: Vec<UserId>,
+    }
+
+    #[entity(accessor = replies)]
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Reply {
+        #[id(auto)]
+        pub id: ReplyId,
+        /// Deleting a post deletes its replies.
+        #[references(Post, on_delete = cascade)]
+        pub post: PostId,
+        /// A user can't be deleted while their replies on other people's
+        /// posts would survive.
+        #[references(User, on_delete = restrict)]
+        pub author: UserId,
+        /// Deleting a reply deletes the replies under it.
+        #[references(Reply, on_delete = cascade)]
+        pub parent: Option<ReplyId>,
+        pub body: String,
+    }
+}
+
+use schema::*;
 
 fn user(db: &Db, name: &str) -> User {
     db.users()
@@ -38,8 +84,8 @@ fn reply(db: &Db, post: &Post, author: &User, parent: Option<&Reply>) -> Reply {
         .unwrap()
 }
 
-backends!(crate::example::blog =>
-    /// The example's `main`, step by step, checking every intermediate state.
+backends!(crate::blog::schema =>
+    /// The tour: build a blog, query it, hit each constraint, tear it down.
     fn walkthrough(db) {
         let alice = user(db, "alice");
         let bob = user(db, "bob");
