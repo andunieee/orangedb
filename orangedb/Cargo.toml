@@ -4,6 +4,7 @@ description = "Typed entities with foreign keys and unique indexes on top of red
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 orangedb-macros.workspace = true

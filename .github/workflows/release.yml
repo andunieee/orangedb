@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing (OIDC)
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check tag matches workspace version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "orangedb") | .version')"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::Tag v$tag does not match workspace version $version"
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      # orangedb depends on orangedb-macros, so macros go first.
+      - name: Publish orangedb-macros
+        run: cargo publish -p orangedb-macros --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish orangedb
+        run: |
+          # Wait for the macros crate to appear in the index.
+          for attempt in $(seq 1 20); do
+            if cargo publish -p orangedb --locked; then
+              exit 0
+            fi
+            echo "Publish failed (attempt $attempt/20), retrying in 15s..."
+            sleep 15
+          done
+          echo "::error::Failed to publish orangedb"
+          exit 1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
