@@ -34,6 +34,8 @@
 //! See the `schema` macro documentation for the full attribute reference.
 
 mod error;
+mod fingerprint;
+mod migrate;
 mod store;
 
 use std::collections::BTreeSet;
@@ -43,7 +45,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub use error::{Error, Result};
-pub use orangedb_macros::schema;
+pub use fingerprint::Fingerprint;
+pub use orangedb_macros::{embed, schema};
 pub use redb;
 pub use store::{Owned, OwnedKey};
 
@@ -51,12 +54,13 @@ pub use store::{Owned, OwnedKey};
 pub trait Entity: Serialize + DeserializeOwned + 'static {
     type Id: OwnedKey + Clone + Ord + Debug;
 
-    /// The struct name, which is also the name of its redb table.
+    /// The struct name, which also names its redb tables.
     const NAME: &'static str;
-    /// `#[entity(version = N)]`, 1 by default.
-    const VERSION: u64;
-    /// A hash of the struct's field names and types, used to catch layout
-    /// changes that were made without bumping `VERSION`.
+    /// A hash of everything that decides how rows are stored and indexed:
+    /// field names, order and types (through their own [`Fingerprint`]s),
+    /// serde attributes that change the encoding, the id kind, references
+    /// and unique fields. It acts as the entity's version: a database that
+    /// stores a different one has to be migrated.
     const FINGERPRINT: u64;
 
     fn id(&self) -> &Self::Id;
@@ -65,9 +69,14 @@ pub trait Entity: Serialize + DeserializeOwned + 'static {
 /// Support code for the generated items. Not a public API.
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::fingerprint::Fp;
+    pub use crate::migrate::*;
     pub use crate::store::*;
     pub use serde;
     pub use uuid;
+
+    /// Keeps [`Fingerprint`] to the types orangedb and its macros declare.
+    pub trait Sealed {}
 
     use super::*;
 
@@ -91,31 +100,8 @@ pub mod __private {
         format!("{id:?}")
     }
 
-    /// Records the entity's version and fingerprint on first open and
-    /// rejects the database if either has changed since.
-    pub fn check_schema<E: Entity>(tx: &redb::WriteTransaction) -> Result<()> {
-        let version_key = format!("{}.version", E::NAME);
-        let fingerprint_key = format!("{}.fingerprint", E::NAME);
-        let stored_version = tx.get(META, &version_key)?;
-        let stored_fingerprint = tx.get(META, &fingerprint_key)?;
-        match (stored_version, stored_fingerprint) {
-            (Some(v), Some(f)) if v == E::VERSION && f == E::FINGERPRINT => Ok(()),
-            (None, None) => {
-                put(tx, META, &version_key, &E::VERSION)?;
-                put(tx, META, &fingerprint_key, &E::FINGERPRINT)
-            }
-            (v, f) => Err(Error::SchemaMismatch {
-                entity: E::NAME,
-                stored_version: v.unwrap_or_default(),
-                stored_fingerprint: f.unwrap_or_default(),
-                version: E::VERSION,
-                fingerprint: E::FINGERPRINT,
-            }),
-        }
-    }
-
     fn seq_key<E: Entity>() -> String {
-        format!("{}.next_id", E::NAME)
+        crate::migrate::seq_key(E::NAME)
     }
 
     /// The id the next auto-increment allocation would return. Ids start at 1.

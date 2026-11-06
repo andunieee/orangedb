@@ -3,23 +3,35 @@
 
 use std::collections::HashMap;
 
-use quote::ToTokens;
+use proc_macro2::TokenStream;
 use syn::parse::ParseStream;
 use syn::spanned::Spanned;
-use syn::{Attribute, Fields, GenericArgument, Ident, Item, ItemMod, ItemStruct, LitInt, PathArguments, Token, Type};
+use syn::{
+    Attribute, Fields, FnArg, GenericArgument, Ident, Item, ItemFn, ItemMod, ItemStruct, PathArguments, Token, Type,
+};
+
+use crate::print::{self, Errors, FieldKind, Print};
 
 pub struct Schema {
     pub entities: Vec<Entity>,
+    pub migration: Option<Migration>,
+}
+
+/// A `#[migrate]` function: `fn(old: &old_schema::ReadTx, new: &WriteTx)`.
+pub struct Migration {
+    pub function: Ident,
+    /// The old schema's `ReadTx`.
+    pub old: Type,
 }
 
 pub struct Entity {
     pub ident: Ident,
     pub vis: syn::Visibility,
-    pub version: u64,
     pub accessor: Ident,
     pub id: IdField,
     pub fields: Vec<Field>,
-    pub fingerprint: u64,
+    /// A const expression for `Entity::FINGERPRINT`.
+    pub fingerprint: TokenStream,
 }
 
 pub struct IdField {
@@ -84,14 +96,27 @@ pub fn schema(module: &mut ItemMod) -> syn::Result<Schema> {
     };
 
     let mut entities = Vec::new();
+    let mut migration: Option<Migration> = None;
     let mut errors = Errors::default();
     for item in items.iter_mut() {
         if let Item::Struct(s) = item
-            && let Some(pos) = s.attrs.iter().position(|a| a.path().is_ident("entity"))
+            && let Some(attr) = take_attr(&mut s.attrs, "entity")
         {
-            let attr = s.attrs.remove(pos);
             match entity(attr, s) {
                 Ok(e) => entities.push(e),
+                Err(e) => errors.push(e),
+            }
+        }
+        if let Item::Fn(f) = item
+            && let Some(attr) = take_attr(&mut f.attrs, "migrate")
+        {
+            match migrate(attr, f) {
+                Ok(_) if migration.is_some() => errors.push(syn::Error::new(
+                    f.sig.ident.span(),
+                    "a schema has one #[migrate] function, from the schema before it; \
+                     older schemas migrate with their own",
+                )),
+                Ok(m) => migration = Some(m),
                 Err(e) => errors.push(e),
             }
         }
@@ -126,22 +151,44 @@ pub fn schema(module: &mut ItemMod) -> syn::Result<Schema> {
     }
 
     errors.finish()?;
-    Ok(Schema { entities })
+    Ok(Schema { entities, migration })
+}
+
+fn migrate(attr: Attribute, f: &ItemFn) -> syn::Result<Migration> {
+    let usage = "expected `fn name(old: &old_schema::ReadTx, new: &WriteTx) -> orangedb::Result<()>`";
+    if !matches!(attr.meta, syn::Meta::Path(_)) {
+        return Err(syn::Error::new(attr.span(), "#[migrate] takes no arguments"));
+    }
+    let args: Vec<&FnArg> = f.sig.inputs.iter().collect();
+    let [FnArg::Typed(old), FnArg::Typed(_)] = args.as_slice() else {
+        return Err(syn::Error::new(f.sig.inputs.span(), usage));
+    };
+    let Type::Reference(old) = &*old.ty else {
+        return Err(syn::Error::new(old.ty.span(), usage));
+    };
+    if old.mutability.is_some() || !f.sig.generics.params.is_empty() {
+        return Err(syn::Error::new(f.sig.span(), usage));
+    }
+    Ok(Migration {
+        function: f.sig.ident.clone(),
+        old: (*old.elem).clone(),
+    })
 }
 
 fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
-    let mut version = 1;
     let mut accessor = None;
     if !matches!(attr.meta, syn::Meta::Path(_)) {
         attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("version") {
-                version = meta.value()?.parse::<LitInt>()?.base10_parse()?;
-                Ok(())
-            } else if meta.path.is_ident("accessor") {
+            if meta.path.is_ident("accessor") {
                 accessor = Some(meta.value()?.parse::<Ident>()?);
                 Ok(())
+            } else if meta.path.is_ident("version") {
+                Err(meta.error(
+                    "entities have no version: the fingerprint is the version, and a changed \
+                     entity is migrated with a #[migrate] function",
+                ))
             } else {
-                Err(meta.error("expected `version = N` or `accessor = name`"))
+                Err(meta.error("expected `accessor = name`"))
             }
         })?;
     }
@@ -156,14 +203,33 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
     let mut errors = Errors::default();
     let mut id = None;
     let mut fields = Vec::new();
-    let mut fingerprint = Fnv::new();
+    let mut fingerprint = Print::new("entity");
+    fingerprint.str(print::FORMAT);
+    match print::serde_attrs(&s.attrs, false) {
+        Ok(wire) => fingerprint.str(&wire.text),
+        Err(e) => errors.push(e),
+    }
     for f in named.named.iter_mut() {
         let ident = f.ident.clone().expect("named field");
         let id_attr = take_attr(&mut f.attrs, "id");
         let ref_attr = take_attr(&mut f.attrs, "references");
         let unique_attr = take_attr(&mut f.attrs, "unique");
-        fingerprint.write(&ident.to_string());
-        fingerprint.write(&tokens(&f.ty));
+        match print::field(&mut fingerprint, f, &ident.to_string()) {
+            Ok(FieldKind::Skipped) if id_attr.is_some() || ref_attr.is_some() || unique_attr.is_some() => {
+                errors.push(syn::Error::new(
+                    ident.span(),
+                    "#[id], #[references] and #[unique] fields can't be `serde(skip)`",
+                ));
+            }
+            Ok(FieldKind::Labelled) if id_attr.is_some() => {
+                errors.push(syn::Error::new(
+                    ident.span(),
+                    "the id's stored format is its key type's, so it can't have a #[fingerprint] label",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => errors.push(e),
+        }
 
         if let Some(attr) = id_attr {
             if ref_attr.is_some() || unique_attr.is_some() {
@@ -178,7 +244,13 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
             }
             match id_field(&attr, ident, &f.ty) {
                 Ok(field) => {
-                    fingerprint.write(&format!("id:{}", tokens(&field.kind.inner())));
+                    // The key type itself is covered by the id newtype's
+                    // fingerprint, which is its inner type's.
+                    fingerprint.str(match field.kind {
+                        IdKind::Auto => "id:auto",
+                        IdKind::Uuid => "id:uuid",
+                        IdKind::Natural(_) => "id:key",
+                    });
                     id = Some(field);
                 }
                 Err(e) => errors.push(e),
@@ -197,7 +269,8 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
                             "on_delete = set_null needs an Option<_> or Vec<_> field",
                         ));
                     }
-                    fingerprint.write(&format!("ref:{}", r.target));
+                    fingerprint.str("references");
+                    fingerprint.str(&r.target.to_string());
                     Some(r)
                 }
                 Err(e) => {
@@ -213,7 +286,7 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
             if shape == Shape::Vec {
                 errors.push(syn::Error::new(attr.span(), "#[unique] is not supported on Vec fields"));
             }
-            fingerprint.write("unique");
+            fingerprint.str("unique");
         }
         fields.push(Field {
             ident,
@@ -240,7 +313,6 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
     Ok(Entity {
         ident: s.ident.clone(),
         vis: s.vis.clone(),
-        version,
         accessor,
         id: id.expect("checked above"),
         fields,
@@ -329,10 +401,6 @@ fn shape(ty: &Type) -> (Shape, Type) {
     (Shape::One, ty.clone())
 }
 
-fn tokens(t: &impl ToTokens) -> String {
-    t.to_token_stream().to_string().split_whitespace().collect()
-}
-
 pub fn snake_case(s: &str) -> String {
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -356,41 +424,5 @@ fn plural(s: &str) -> String {
         format!("{s}es")
     } else {
         format!("{s}s")
-    }
-}
-
-/// FNV-1a: stable across compiler versions, unlike `DefaultHasher`.
-struct Fnv(u64);
-
-impl Fnv {
-    fn new() -> Self {
-        Fnv(0xcbf29ce484222325)
-    }
-
-    fn write(&mut self, s: &str) {
-        for b in s.bytes().chain([0xff]) {
-            self.0 ^= u64::from(b);
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Default)]
-struct Errors(Option<syn::Error>);
-
-impl Errors {
-    fn push(&mut self, e: syn::Error) {
-        match &mut self.0 {
-            Some(all) => all.combine(e),
-            None => self.0 = Some(e),
-        }
-    }
-
-    fn finish(self) -> syn::Result<()> {
-        self.0.map_or(Ok(()), Err)
     }
 }

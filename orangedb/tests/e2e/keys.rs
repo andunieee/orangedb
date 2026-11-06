@@ -46,7 +46,7 @@ pub mod catalog {
         pub ordinal: DayOrdinal,
     }
 
-    #[entity(accessor = entries, version = 3)]
+    #[entity(accessor = entries)]
     #[derive(Debug, Clone, PartialEq)]
     pub struct LogEntry {
         #[id(auto)]
@@ -70,8 +70,6 @@ fn entity_impl() {
     assert_eq!(Category::NAME, "Category");
     assert_eq!(BlogPost::NAME, "BlogPost");
     assert_eq!(LogEntry::NAME, "LogEntry");
-    assert_eq!(Category::VERSION, 1);
-    assert_eq!(LogEntry::VERSION, 3);
     let prints = [
         Category::FINGERPRINT,
         Batch::FINGERPRINT,

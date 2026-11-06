@@ -1,4 +1,5 @@
-//! Natural keys, nullable references and schema checks on reopen.
+//! Natural keys, nullable references, and schema checks and migrations on
+//! reopen.
 
 #[orangedb::schema]
 mod v1 {
@@ -50,10 +51,24 @@ mod v1_changed {
     }
 }
 
-/// The same change, with the version bumped.
+/// The same change, with a migration from `v1`.
 #[orangedb::schema]
 mod v2 {
-    #[entity(version = 2)]
+    use super::v1;
+
+    #[migrate]
+    fn from_v1(old: &v1::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
+        for team in old.teams().all()? {
+            new.teams().insert(&Team {
+                motto: format!("{} forever", team.slug.0),
+                slug: TeamSlug(team.slug.0),
+                domain: team.domain,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[entity]
     pub struct Team {
         #[id(String)]
         pub slug: TeamSlug,
@@ -157,31 +172,23 @@ fn schema_is_checked_on_open() {
 
     let err = v1_changed::Db::open(&path).err().unwrap();
     assert!(
-        matches!(
-            err,
-            Error::SchemaMismatch {
-                entity: "Team",
-                stored_version: 1,
-                version: 1,
-                ..
-            }
-        ),
+        matches!(err, Error::SchemaMismatch { entity: "Team", stored, declared }
+            if stored == <v1::Team as orangedb::Entity>::FINGERPRINT
+                && declared == <v1_changed::Team as orangedb::Entity>::FINGERPRINT),
         "{err}"
     );
-    let err = v2::Db::open(&path).err().unwrap();
-    assert!(
-        matches!(
-            err,
-            Error::SchemaMismatch {
-                entity: "Team",
-                stored_version: 1,
-                version: 2,
-                ..
-            }
-        ),
-        "{err}"
-    );
-
     // A rejected open leaves the stored schema alone.
     v1::Db::open(&path).unwrap();
+
+    let db = v2::Db::open(&path).unwrap();
+    assert_eq!(
+        db.teams().get(v2::TeamSlug::new("core")).unwrap().unwrap().motto,
+        "core forever"
+    );
+    drop(db);
+    // Now the database is at v2, and v1 can't open it.
+    assert!(matches!(
+        v1::Db::open(&path).err().unwrap(),
+        Error::SchemaMismatch { entity: "Team", .. }
+    ));
 }

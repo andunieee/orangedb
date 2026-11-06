@@ -4,7 +4,7 @@
 //! in the schema module itself; table definitions and the constraint logic
 //! live in a private `__orangedb` submodule.
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 use syn::{Ident, LitStr};
 
@@ -23,7 +23,6 @@ pub fn expand(schema: &Schema) -> TokenStream {
     let detaches: Vec<Ident> = entities.iter().map(|e| fn_name("detach", e)).collect();
     let erases: Vec<Ident> = entities.iter().map(|e| fn_name("erase", e)).collect();
     let creates = entities.iter().map(|e| {
-        let ident = &e.ident;
         let rows = rows_const(e);
         let fks = e
             .fields
@@ -32,12 +31,55 @@ pub fn expand(schema: &Schema) -> TokenStream {
             .map(|f| fk_const(e, f));
         let uniques = e.fields.iter().filter(|f| f.unique).map(|f| unique_const(e, f));
         quote! {
-            rt::check_schema::<#ident>(tx)?;
             rt::create_row_table(tx, #rows)?;
             #( rt::create_multimap_table(tx, #fks)?; )*
             #( rt::create_table(tx, #uniques)?; )*
         }
     });
+
+    let verifies = entities
+        .iter()
+        .filter(|e| e.fields.iter().any(|f| f.references.is_some()))
+        .map(|e| {
+            let ident = &e.ident;
+            let rows = rows_const(e);
+            let check = fn_name("check", e);
+            quote! {
+                for bytes in rt::Store::rows(tx, #rows)? {
+                    #check(tx, &rt::decode::<#ident>(&bytes)?, true)?;
+                }
+            }
+        });
+    let migrate = match &schema.migration {
+        None => quote!(Ok(false)),
+        Some(m) => {
+            let function = &m.function;
+            let old = &m.old;
+            quote! {
+                type Old = #old;
+                type OldSchema = <Old as ::orangedb::__private::SchemaReadTx>::Schema;
+                ::orangedb::__private::open::<OldSchema>(db)?;
+                let old = <Old as ::orangedb::__private::SchemaReadTx>::from_redb(::orangedb::__private::begin_read(db)?);
+                let tx = WriteTx { inner: db.begin_write()?, migrating: true };
+                let result = (|| -> ::orangedb::Result<()> {
+                    <Self as ::orangedb::__private::Schema>::create_tables(&tx.inner)?;
+                    #function(&old, &tx)?;
+                    ::orangedb::__private::finish_migration::<OldSchema, Self>(&tx.inner)
+                })();
+                drop(old);
+                match result {
+                    Ok(()) => {
+                        tx.inner.commit()?;
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        let _ = tx.inner.abort();
+                        Err(e)
+                    }
+                }
+            }
+        }
+    };
 
     quote! {
         #( #public )*
@@ -62,10 +104,10 @@ pub fn expand(schema: &Schema) -> TokenStream {
 
             /// Wraps an already-open redb database, creating the schema's
             /// tables and checking that its stored schema matches this one.
+            /// If it doesn't, the schema's `#[migrate]` function brings it
+            /// up to date.
             pub fn from_redb(inner: ::orangedb::redb::Database) -> ::orangedb::Result<Self> {
-                let tx = inner.begin_write()?;
-                __orangedb::init(&tx)?;
-                tx.commit()?;
+                ::orangedb::__private::open::<Self>(&inner)?;
                 Ok(Self { inner })
             }
 
@@ -75,7 +117,10 @@ pub fn expand(schema: &Schema) -> TokenStream {
                 &self,
                 f: impl ::std::ops::FnOnce(&WriteTx) -> ::std::result::Result<R, Er>,
             ) -> ::std::result::Result<R, Er> {
-                let tx = WriteTx { inner: self.inner.begin_write().map_err(::orangedb::Error::from)? };
+                let tx = WriteTx {
+                    inner: self.inner.begin_write().map_err(::orangedb::Error::from)?,
+                    migrating: false,
+                };
                 match f(&tx) {
                     Ok(out) => {
                         tx.inner.commit().map_err(::orangedb::Error::from)?;
@@ -105,15 +150,18 @@ pub fn expand(schema: &Schema) -> TokenStream {
             )*
         }
 
-        /// A write transaction, see [`Db::write`].
+        /// A write transaction, see [`Db::write`]. In a `#[migrate]`
+        /// function, references are only checked once it returns, so rows
+        /// can be written in any order.
         pub struct WriteTx {
             inner: ::orangedb::redb::WriteTransaction,
+            migrating: bool,
         }
 
         impl WriteTx {
             #(
                 pub fn #accessors(&self) -> #tables<'_, ::orangedb::redb::WriteTransaction> {
-                    #tables { tx: &self.inner }
+                    #tables { tx: &self.inner, migrating: self.migrating }
                 }
             )*
         }
@@ -126,9 +174,35 @@ pub fn expand(schema: &Schema) -> TokenStream {
         impl ReadTx {
             #(
                 pub fn #accessors(&self) -> #tables<'_, ::orangedb::redb::ReadTransaction> {
-                    #tables { tx: &self.inner }
+                    #tables { tx: &self.inner, migrating: false }
                 }
             )*
+        }
+
+        impl ::orangedb::__private::SchemaReadTx for ReadTx {
+            type Schema = Db;
+
+            fn from_redb(inner: ::orangedb::redb::ReadTransaction) -> Self {
+                ReadTx { inner }
+            }
+        }
+
+        impl ::orangedb::__private::Schema for Db {
+            const ENTITIES: &'static [(&'static str, u64)] = &[
+                #( (stringify!(#names), <#names as ::orangedb::Entity>::FINGERPRINT), )*
+            ];
+
+            fn create_tables(tx: &::orangedb::redb::WriteTransaction) -> ::orangedb::Result<()> {
+                __orangedb::create_tables(tx)
+            }
+
+            fn verify(tx: &::orangedb::redb::WriteTransaction) -> ::orangedb::Result<()> {
+                __orangedb::verify(tx)
+            }
+
+            fn migrate(db: &::orangedb::redb::Database) -> ::orangedb::Result<bool> {
+                #migrate
+            }
         }
 
         #[doc(hidden)]
@@ -161,9 +235,13 @@ pub fn expand(schema: &Schema) -> TokenStream {
                 }
             }
 
-            pub fn init(tx: &WriteTransaction) -> Result<()> {
-                rt::create_table(tx, rt::META)?;
+            pub fn create_tables(tx: &WriteTransaction) -> Result<()> {
                 #( #creates )*
+                Ok(())
+            }
+
+            pub fn verify(tx: &WriteTransaction) -> Result<()> {
+                #( #verifies )*
                 Ok(())
             }
 
@@ -201,8 +279,8 @@ fn public_items(schema: &Schema, e: &Entity) -> TokenStream {
     let id_ty = &e.id.ty;
     let id_field = &e.id.ident;
     let inner = e.id.kind.inner();
-    let version = e.version;
-    let fingerprint = e.fingerprint;
+    let fingerprint = &e.fingerprint;
+    let inner_print = crate::print::type_print(&inner);
     let table = format_ident!("{}Table", ident);
     let auto = format_ident!("{}AutoTable", ident);
     let accessor = &e.accessor;
@@ -251,6 +329,13 @@ fn public_items(schema: &Schema, e: &Entity) -> TokenStream {
 
         #constructor
 
+        impl ::orangedb::__private::Sealed for #id_ty {}
+
+        /// Stored as the key it wraps.
+        impl ::orangedb::Fingerprint for #id_ty {
+            const FINGERPRINT: u64 = #inner_print;
+        }
+
         impl ::orangedb::redb::Value for #id_ty {
             type SelfType<'a> = #id_ty where Self: 'a;
             type AsBytes<'a> = <#inner as ::orangedb::redb::Value>::AsBytes<'a> where Self: 'a;
@@ -289,7 +374,6 @@ fn public_items(schema: &Schema, e: &Entity) -> TokenStream {
         impl ::orangedb::Entity for #ident {
             type Id = #id_ty;
             const NAME: &'static str = #name;
-            const VERSION: u64 = #version;
             const FINGERPRINT: u64 = #fingerprint;
 
             fn id(&self) -> &#id_ty {
@@ -301,6 +385,7 @@ fn public_items(schema: &Schema, e: &Entity) -> TokenStream {
         /// transaction kinds, writes only in a [`WriteTx`].
         pub struct #table<'t, S> {
             tx: &'t S,
+            migrating: bool,
         }
 
         impl<'t, S: ::orangedb::__private::Store> #table<'t, S> {
@@ -508,7 +593,7 @@ fn methods(schema: &Schema, e: &Entity) -> Vec<Method> {
                         id: ::orangedb::__private::fmt_id(&row.#id_field),
                     });
                 }
-                __orangedb::#check(self.tx, row)?;
+                __orangedb::#check(self.tx, row, !self.migrating)?;
                 #observe
                 __orangedb::#store(self.tx, row, None)
             },
@@ -524,7 +609,7 @@ fn methods(schema: &Schema, e: &Entity) -> Vec<Method> {
                     entity: <#ident as ::orangedb::Entity>::NAME,
                     id: ::orangedb::__private::fmt_id(&row.#id_field),
                 })?;
-                __orangedb::#check(self.tx, row)?;
+                __orangedb::#check(self.tx, row, !self.migrating)?;
                 __orangedb::#store(self.tx, row, Some(&old))
             },
         ),
@@ -536,7 +621,7 @@ fn methods(schema: &Schema, e: &Entity) -> Vec<Method> {
             quote!(()),
             quote! {
                 let old = self.get(&row.#id_field)?;
-                __orangedb::#check(self.tx, row)?;
+                __orangedb::#check(self.tx, row, !self.migrating)?;
                 #observe
                 __orangedb::#store(self.tx, row, old.as_ref())
             },
@@ -596,7 +681,6 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
     let id_ty = &e.id.ty;
     let id_field = &e.id.ident;
     let rows = rows_const(e);
-    let rows_name = LitStr::new(&ident.to_string(), ident.span());
     let store = fn_name("store", e);
     let check = fn_name("check", e);
     let erase = fn_name("erase", e);
@@ -610,16 +694,23 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
         .iter()
         .map(|f| {
             let target_id = &schema.entity(&f.references.as_ref().unwrap().target).id.ty;
-            let name = fk_const(e, f);
-            let table = LitStr::new(&format!("{ident}.{}.fk", f.ident), f.ident.span());
-            quote!(pub const #name: MultimapTableDefinition<'static, #target_id, #id_ty> = MultimapTableDefinition::new(#table);)
+            table_const(
+                e,
+                &fk_const(e, f),
+                quote!(MultimapTableDefinition<'static, #target_id, #id_ty>),
+                &format!(".{}.fk", f.ident),
+            )
         })
         .chain(uniques.iter().map(|f| {
             let inner = &f.inner;
-            let name = unique_const(e, f);
-            let table = LitStr::new(&format!("{ident}.{}.unique", f.ident), f.ident.span());
-            quote!(pub const #name: TableDefinition<'static, #inner, #id_ty> = TableDefinition::new(#table);)
+            table_const(
+                e,
+                &unique_const(e, f),
+                quote!(TableDefinition<'static, #inner, #id_ty>),
+                &format!(".{}.unique", f.ident),
+            )
         }));
+    let rows_table = table_const(e, &rows, quote!(rt::RowTable<#id_ty>), "");
 
     let fk_names: Vec<Ident> = fks.iter().map(|f| fk_const(e, f)).collect();
     let uq_names: Vec<Ident> = uniques.iter().map(|f| unique_const(e, f)).collect();
@@ -736,12 +827,15 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
     });
 
     quote! {
-        pub const #rows: rt::RowTable<#id_ty> = TableDefinition::new(#rows_name);
+        #rows_table
         #( #consts )*
 
-        /// Rejects `row` if a reference dangles or a unique value is taken.
-        pub fn #check(tx: &WriteTransaction, row: &#ident) -> Result<()> {
-            #( #fk_checks )*
+        /// Rejects `row` if a unique value is taken or, with `fks`, if a
+        /// reference dangles.
+        pub fn #check(tx: &WriteTransaction, row: &#ident, fks: bool) -> Result<()> {
+            if fks {
+                #( #fk_checks )*
+            }
             #( #uq_checks )*
             Ok(())
         }
@@ -787,6 +881,24 @@ fn values(row: TokenStream, f: &Field) -> TokenStream {
     match f.shape {
         Shape::One => quote!(::std::iter::once(&#row.#field)),
         Shape::Option | Shape::Vec => quote!(#row.#field.iter()),
+    }
+}
+
+/// A table definition named `{Entity}@{fingerprint}{suffix}`, so that each
+/// layout of an entity has tables of its own.
+fn table_const(e: &Entity, name: &Ident, ty: TokenStream, suffix: &str) -> TokenStream {
+    let ident = &e.ident;
+    let bytes = format_ident!("{}_NAME", name);
+    let len = Literal::usize_unsuffixed(ident.to_string().len() + 1 + 16 + suffix.len());
+    let def = if suffix.ends_with(".fk") {
+        quote!(MultimapTableDefinition)
+    } else {
+        quote!(TableDefinition)
+    };
+    quote! {
+        const #bytes: [u8; #len] =
+            rt::table_name(stringify!(#ident), <#ident as ::orangedb::Entity>::FINGERPRINT, #suffix);
+        pub const #name: #ty = #def::new(rt::utf8(&#bytes));
     }
 }
 

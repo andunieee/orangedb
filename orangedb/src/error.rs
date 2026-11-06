@@ -45,17 +45,26 @@ pub enum Error {
     },
 
     #[error(
-        "{entity} schema mismatch: the database holds version {stored_version} \
-         (fingerprint {stored_fingerprint:016x}), the code declares version {version} \
-         (fingerprint {fingerprint:016x})"
+        "{entity} schema mismatch: the database stores fingerprint {stored:016x}, the code declares \
+         {declared:016x}, and no #[migrate] function leads from one to the other"
     )]
     SchemaMismatch {
         entity: &'static str,
-        stored_version: u64,
-        stored_fingerprint: u64,
-        version: u64,
-        fingerprint: u64,
+        stored: u64,
+        declared: u64,
     },
+
+    /// Returned by a `#[migrate]` function that gives up, see
+    /// [`Error::migration`]. The database stays at the old schema.
+    #[error("migration failed: {0}")]
+    Migration(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl Error {
+    /// Fails a migration with your own error or message.
+    pub fn migration(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Error::Migration(error.into())
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

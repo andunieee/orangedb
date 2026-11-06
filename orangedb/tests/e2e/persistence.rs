@@ -303,16 +303,6 @@ mod shop {
                 pub price: u32,
             }
         }
-        /// The layout is unchanged but the version is bumped.
-        bumped {
-            #[entity(version = 2)]
-            pub struct Item {
-                #[id(auto)]
-                pub id: ItemId,
-                pub name: String,
-                pub price: u32,
-            }
-        }
     }
 }
 
@@ -376,27 +366,24 @@ fn schema_changes_that_break_the_layout_are_rejected() {
         ("reordered", shop::reordered::Db::open(&path).err()),
         ("made_unique", shop::made_unique::Db::open(&path).err()),
         ("uuid_id", shop::uuid_id::Db::open(&path).err()),
-        ("bumped", shop::bumped::Db::open(&path).err()),
     ];
+    let stored = <shop::v1::Item as orangedb::Entity>::FINGERPRINT;
     for (variant, err) in errors {
         let err = err.unwrap_or_else(|| panic!("{variant} opened"));
-        let expected_version = if variant == "bumped" { 2 } else { 1 };
         assert!(
-            matches!(
-                err,
-                Error::SchemaMismatch { entity: "Item", stored_version: 1, version, .. } if version == expected_version
-            ),
+            matches!(err, Error::SchemaMismatch { entity: "Item", stored: s, declared, .. } if s == stored && declared != stored),
             "{variant}: {err}"
         );
         assert!(
-            err.to_string()
-                .starts_with("Item schema mismatch: the database holds version 1"),
+            err.to_string().starts_with(&format!(
+                "Item schema mismatch: the database stores fingerprint {stored:016x}"
+            )),
             "{err}"
         );
     }
 
-    // With `Order` declared first, its index on `ItemId` is opened before
-    // `Item`'s schema is checked, so redb rejects the new key type itself.
+    // The id's key type is part of `Order`'s fingerprint too, through
+    // `ItemId`, so whichever entity is checked first is the one reported.
     #[orangedb::schema]
     mod uuid_id_order_first {
         #[entity]
@@ -416,7 +403,7 @@ fn schema_changes_that_break_the_layout_are_rejected() {
         }
     }
     let err = uuid_id_order_first::Db::open(&path).err().unwrap();
-    assert!(matches!(err, Error::Storage(_)), "{err}");
+    assert!(matches!(err, Error::SchemaMismatch { entity: "Order", .. }), "{err}");
 
     // None of the rejected opens touched the file.
     let db = shop::v1::Db::open(&path).unwrap();

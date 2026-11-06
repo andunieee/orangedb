@@ -1,5 +1,7 @@
+mod embed;
 mod expand;
 mod parse;
+mod print;
 
 use proc_macro::TokenStream;
 use syn::{Item, ItemMod, parse_macro_input};
@@ -17,7 +19,7 @@ use syn::{Item, ItemMod, parse_macro_input};
 ///         pub email: String,
 ///     }
 ///
-///     #[entity(version = 2, accessor = replies)]
+///     #[entity(accessor = replies)]
 ///     pub struct Reply {
 ///         #[id(auto)]
 ///         pub id: ReplyId,
@@ -31,10 +33,16 @@ use syn::{Item, ItemMod, parse_macro_input};
 ///
 /// # Entities
 ///
-/// `#[entity]` marks a struct as a table. It accepts `version = N` (default
-/// 1, stored in the database and checked on open) and `accessor = name` (the
+/// `#[entity]` marks a struct as a table. It accepts `accessor = name` (the
 /// method on `Db`/`ReadTx`/`WriteTx`, by default the plural snake case of the
 /// struct name). Serde derives are added for you, so don't add your own.
+///
+/// Every field's type must have an `orangedb::Fingerprint`: std types and
+/// ids do, and your own structs and enums get one from `#[embed]` (or
+/// `#[orangedb::embed]` outside the schema module). For a type you can't
+/// annotate, such as one from another crate stored through
+/// `#[serde(with = ...)]`, give the field `#[fingerprint = "label"]` and
+/// change the label whenever its stored format changes.
 ///
 /// # Ids
 ///
@@ -58,6 +66,39 @@ use syn::{Item, ItemMod, parse_macro_input};
 ///
 /// `#[unique]` on a field of a redb key type (or an `Option` of one) rejects
 /// duplicate values and adds a `by_field(value)` lookup.
+///
+/// # Fingerprints and migrations
+///
+/// Each entity has a fingerprint of how its rows are stored and indexed,
+/// which the database records. Opening a database that stores a different
+/// fingerprint for an entity runs the schema's `#[migrate]` function, or
+/// fails with `Error::SchemaMismatch` if it has none:
+///
+/// ```ignore
+/// #[orangedb::schema]
+/// pub mod v2 {
+///     use super::v1;
+///
+///     #[migrate]
+///     fn from_v1(old: &v1::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
+///         for user in old.users().all()? {
+///             new.users().insert(&User { id: UserId(user.id.0), email: user.email, verified: false })?;
+///         }
+///         Ok(())
+///     }
+///
+///     #[entity]
+///     pub struct User { /* ... */ }
+/// }
+/// ```
+///
+/// The function reads the database as the old schema saw it and writes it
+/// at the new one, in a single transaction. Entities whose fingerprint
+/// didn't change are already there; the others start out empty, and their
+/// old tables are dropped afterwards, as are entities the new schema no
+/// longer declares. References are checked once the function returns, so
+/// rows can be written in any order. If the database is older still, the old
+/// schema's own `#[migrate]` function runs first.
 #[proc_macro_attribute]
 pub fn schema(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
@@ -72,17 +113,66 @@ pub fn schema(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let items = &mut module.content.as_mut().expect("checked while parsing").1;
+    let mut embedded = Vec::new();
+    for item in items.iter_mut() {
+        let attrs = match item {
+            Item::Struct(s) => &mut s.attrs,
+            Item::Enum(e) => &mut e.attrs,
+            _ => continue,
+        };
+        if let Some(pos) = attrs.iter().position(|a| a.path().is_ident("embed")) {
+            attrs.remove(pos);
+            match embed::expand(item) {
+                Ok(tokens) => embedded.push(tokens),
+                Err(e) => return e.into_compile_error().into(),
+            }
+        }
+    }
+    items.extend(embedded.into_iter().map(Item::Verbatim));
     for item in items.iter_mut() {
         if let Item::Struct(s) = item
             && schema.entities.iter().any(|e| e.ident == s.ident)
         {
-            s.attrs.push(syn::parse_quote! {
-                #[derive(::orangedb::__private::serde::Serialize, ::orangedb::__private::serde::Deserialize)]
-            });
+            // Ahead of the struct's own attributes, which may use `serde`.
+            s.attrs.insert(
+                0,
+                syn::parse_quote! {
+                    #[derive(::orangedb::__private::serde::Serialize, ::orangedb::__private::serde::Deserialize)]
+                },
+            );
             s.attrs
-                .push(syn::parse_quote!(#[serde(crate = "::orangedb::__private::serde")]));
+                .insert(1, syn::parse_quote!(#[serde(crate = "::orangedb::__private::serde")]));
         }
     }
     items.push(Item::Verbatim(expand::expand(&schema)));
     quote::quote!(#module).into()
+}
+
+/// Declares a struct or enum that entities can store in their fields, by
+/// deriving serde for it and giving it an `orangedb::Fingerprint`. Inside
+/// a schema module, write it as `#[embed]`.
+///
+/// ```ignore
+/// #[orangedb::embed]
+/// pub struct Address {
+///     pub street: String,
+///     pub city: String,
+/// }
+/// ```
+///
+/// The fingerprint covers the field and variant names, their order and
+/// shapes, the fields' own fingerprints and the serde attributes that change
+/// the stored bytes. Generic types are fine; recursive ones are not.
+#[proc_macro_attribute]
+pub fn embed(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(proc_macro2::Span::call_site(), "#[orangedb::embed] takes no arguments")
+            .into_compile_error()
+            .into();
+    }
+    let mut item = parse_macro_input!(item as Item);
+    match embed::expand(&mut item) {
+        Ok(impls) => quote::quote!(#item #impls).into(),
+        Err(e) => e.into_compile_error().into(),
+    }
 }
