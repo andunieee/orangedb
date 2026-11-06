@@ -565,10 +565,16 @@ fn methods(schema: &Schema, e: &Entity) -> Vec<Method> {
                 &format!("by_{field}"),
                 vec![("parent", quote!(impl ::std::borrow::Borrow<#target_id>))],
                 quote!(::std::vec::Vec<#ident>),
+                // A listed id with no row means a corrupt index: report it.
                 quote! {
                     self.#ids_by(parent)?
                         .into_iter()
-                        .filter_map(|id| self.get(id).transpose())
+                        .map(|id| {
+                            self.get(&id)?.ok_or_else(|| ::orangedb::Error::NotFound {
+                                entity: <#ident as ::orangedb::Entity>::NAME,
+                                id: ::orangedb::__private::fmt_id(&id),
+                            })
+                        })
                         .collect()
                 },
             ));
@@ -842,10 +848,12 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
 
         /// Writes `row` and moves its index entries over from `old`.
         pub fn #store(tx: &WriteTransaction, row: &#ident, old: Option<&#ident>) -> Result<()> {
+            // Encode first: a codec error must not leave `old` unlinked.
+            let bytes = rt::encode(row)?;
             if let Some(old) = old {
                 #unlink_old
             }
-            rt::put_row(tx, #rows, &row.#id_field, &rt::encode(row)?)?;
+            rt::put_row(tx, #rows, &row.#id_field, &bytes)?;
             #( for parent in #fk_new { rt::link(tx, #fk_names, parent, &row.#id_field)?; } )*
             #( for value in #uq_new { rt::put(tx, #uq_names, value, &row.#id_field)?; } )*
             Ok(())
