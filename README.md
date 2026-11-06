@@ -13,7 +13,7 @@ reference's `on_delete` rule.
 
 ```toml
 [dependencies]
-orangedb = { git = "https://github.com/andunieee/orangedb" }
+orangedb = "0.1"
 ```
 
 ### Declare a schema
@@ -165,7 +165,7 @@ schema fails with `Error::SchemaMismatch`. If you change a struct, bump its
 
 ## A complete example
 
-The end-to-end suite in [`orangedb/tests/e2e`](orangedb/tests/e2e) covers the
+The end-to-end suite in [`orangedb/tests/e2e`](https://github.com/andunieee/orangedb/tree/master/orangedb/tests/e2e) covers the
 whole lifecycle: every id kind and reference shape, each `on_delete` rule,
 index lookups, constraint failures, transactions, and reopening a database
 file. Run it with:
