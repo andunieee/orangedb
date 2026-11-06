@@ -38,6 +38,7 @@ macro_rules! backends {
 
 mod blog;
 mod fingerprints;
+mod index_migrations;
 mod keys;
 mod migrations;
 mod persistence;

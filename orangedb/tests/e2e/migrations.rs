@@ -245,7 +245,7 @@ fn seed(path: &Path) {
     db.drafts().create(|id| v1::Draft { id, body: "wip".into() }).unwrap();
 }
 
-fn table_names(path: &Path) -> Vec<String> {
+pub fn table_names(path: &Path) -> Vec<String> {
     let db = orangedb::redb::Database::create(path).unwrap();
     let tx = db.begin_read().unwrap();
     let mut names: Vec<String> = tx.list_tables().unwrap().map(|t| t.name().to_string()).collect();
