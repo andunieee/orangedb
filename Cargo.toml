@@ -3,10 +3,11 @@ resolver = "3"
 members = ["orangedb", "orangedb-cli", "orangedb-macros"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/andunieee/orangedb"
 
 [workspace.dependencies]
-orangedb-macros = { path = "orangedb-macros", version = "0.1.0" }
+orangedb = { path = "orangedb", version = "0.2.0" }
+orangedb-macros = { path = "orangedb-macros", version = "0.2.0" }
