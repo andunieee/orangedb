@@ -10,7 +10,8 @@ use syn::{Ident, LitStr};
 
 use crate::parse::{Entity, Field, IdKind, OnDelete, Schema, Shape, snake_case};
 
-pub fn expand(schema: &Schema) -> TokenStream {
+pub fn expand(schema: &Schema, source: &str) -> TokenStream {
+    let source = LitStr::new(source, proc_macro2::Span::call_site());
     let entities = &schema.entities;
     let public = entities.iter().map(|e| public_items(schema, e));
     let internal = entities.iter().map(|e| internal_items(schema, e));
@@ -50,6 +51,7 @@ pub fn expand(schema: &Schema) -> TokenStream {
                 }
             }
         });
+    let layouts = entities.iter().map(layout);
     let migrate = match &schema.migration {
         None => quote!(Ok(false)),
         Some(m) => {
@@ -109,6 +111,34 @@ pub fn expand(schema: &Schema) -> TokenStream {
             pub fn from_redb(inner: ::orangedb::redb::Database) -> ::orangedb::Result<Self> {
                 ::orangedb::__private::open::<Self>(&inner)?;
                 Ok(Self { inner })
+            }
+
+            /// The schema source recorded for the stored layout of `E`, if
+            /// this database has one. Use `E` from an older schema module to
+            /// read what a migrated layout looked like.
+            pub fn stored_source<E: ::orangedb::Entity>(
+                &self,
+            ) -> ::orangedb::Result<::std::option::Option<::std::string::String>> {
+                self.stored_source_at(E::NAME, E::FINGERPRINT)
+            }
+
+            /// The schema source recorded for `entity` at `fingerprint`, if
+            /// this database has one, even when the entity's Rust type is no
+            /// longer declared.
+            pub fn stored_source_at(
+                &self,
+                entity: &str,
+                fingerprint: u64,
+            ) -> ::orangedb::Result<::std::option::Option<::std::string::String>> {
+                ::orangedb::__private::stored_source(&self.inner, entity, fingerprint)
+            }
+
+            /// What the database records about its layouts: the tables,
+            /// references, unique fields and source of every entity at every
+            /// fingerprint it has stored, current or migrated away from.
+            pub fn stored_catalog(&self) -> ::orangedb::Result<::orangedb::catalog::Catalog> {
+                use ::orangedb::redb::ReadableDatabase as _;
+                ::orangedb::catalog::Catalog::read(&self.inner.begin_read()?)
             }
 
             /// Runs `f` in a write transaction, committing if it returns `Ok`
@@ -191,6 +221,14 @@ pub fn expand(schema: &Schema) -> TokenStream {
             const ENTITIES: &'static [(&'static str, u64)] = &[
                 #( (stringify!(#names), <#names as ::orangedb::Entity>::FINGERPRINT), )*
             ];
+
+            const SOURCE: &'static str = #source;
+
+            fn layouts(source: u64) -> ::std::vec::Vec<::orangedb::catalog::Layout> {
+                use ::orangedb::catalog as c;
+                use ::orangedb::redb::{MultimapTableHandle as _, TableHandle as _};
+                ::std::vec![ #( #layouts ),* ]
+            }
 
             fn create_tables(tx: &::orangedb::redb::WriteTransaction) -> ::orangedb::Result<()> {
                 __orangedb::create_tables(tx)
@@ -881,6 +919,97 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
             Ok(())
         }
     }
+}
+
+/// The catalog entry for `e`, an expression of type `catalog::Layout`.
+fn layout(e: &Entity) -> TokenStream {
+    let ident = &e.ident;
+    let name = LitStr::new(&ident.to_string(), ident.span());
+    let id_field = LitStr::new(&e.id.ident.to_string(), e.id.ident.span());
+    let id_ty = LitStr::new(&e.id.ty.to_string(), e.id.ty.span());
+    let fields = e.stored.iter().map(|(name, ty)| {
+        let name = LitStr::new(&name.to_string(), name.span());
+        let ty = match ty {
+            Some(ty) => {
+                let ty = type_text(ty);
+                quote!(::std::option::Option::Some(#ty.into()))
+            }
+            None => quote!(::std::option::Option::None),
+        };
+        quote!(c::Field { name: #name.into(), ty: #ty })
+    });
+    let id_kind = match &e.id.kind {
+        IdKind::Auto => quote!(c::IdKind::Auto),
+        IdKind::Uuid => quote!(c::IdKind::Uuid),
+        IdKind::Natural(ty) => {
+            let ty = type_text(ty);
+            quote!(c::IdKind::Key(#ty.into()))
+        }
+    };
+    let rows = rows_const(e);
+    let references = e.fields.iter().filter_map(|f| {
+        let r = f.references.as_ref()?;
+        let field = LitStr::new(&f.ident.to_string(), f.ident.span());
+        let shape = shape(f.shape);
+        let target = LitStr::new(&r.target.to_string(), r.target.span());
+        let on_delete = match r.on_delete {
+            OnDelete::Restrict => quote!(c::OnDelete::Restrict),
+            OnDelete::Cascade => quote!(c::OnDelete::Cascade),
+            OnDelete::SetNull => quote!(c::OnDelete::SetNull),
+        };
+        let fk = fk_const(e, f);
+        Some(quote! {
+            c::Reference {
+                field: #field.into(),
+                shape: #shape,
+                target: #target.into(),
+                on_delete: #on_delete,
+                index: __orangedb::#fk.name().into(),
+            }
+        })
+    });
+    let uniques = e.fields.iter().filter(|f| f.unique).map(|f| {
+        let field = LitStr::new(&f.ident.to_string(), f.ident.span());
+        let shape = shape(f.shape);
+        let ty = type_text(&f.inner);
+        let uq = unique_const(e, f);
+        quote! {
+            c::Unique {
+                field: #field.into(),
+                shape: #shape,
+                ty: #ty.into(),
+                index: __orangedb::#uq.name().into(),
+            }
+        }
+    });
+    quote! {
+        c::Layout {
+            entity: #name.into(),
+            fingerprint: <#ident as ::orangedb::Entity>::FINGERPRINT,
+            id: c::Id { field: #id_field.into(), ty: #id_ty.into(), kind: #id_kind },
+            fields: ::std::vec![ #( #fields ),* ],
+            rows: __orangedb::#rows.name().into(),
+            references: ::std::vec![ #( #references ),* ],
+            uniques: ::std::vec![ #( #uniques ),* ],
+            source,
+        }
+    }
+}
+
+fn shape(shape: Shape) -> TokenStream {
+    match shape {
+        Shape::One => quote!(c::Shape::One),
+        Shape::Option => quote!(c::Shape::Option),
+        Shape::Vec => quote!(c::Shape::Vec),
+    }
+}
+
+/// A type as written, without the spaces token printing puts in it.
+fn type_text(ty: &syn::Type) -> LitStr {
+    LitStr::new(
+        &quote!(#ty).to_string().replace(' ', ""),
+        proc_macro2::Span::call_site(),
+    )
 }
 
 /// An iterator over the values in field `f` of `row`, whatever its shape.

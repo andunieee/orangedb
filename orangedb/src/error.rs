@@ -54,6 +54,9 @@ pub enum Error {
         declared: u64,
     },
 
+    #[error("the database's catalog uses format {format}, which this version of orangedb can't read")]
+    CatalogFormat { format: u32 },
+
     /// Returned by a `#[migrate]` function that gives up, see
     /// [`Error::migration`]. The database stays at the old schema.
     #[error("migration failed: {0}")]

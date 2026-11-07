@@ -33,6 +33,7 @@
 //!
 //! See the `schema` macro documentation for the full attribute reference.
 
+pub mod catalog;
 mod error;
 mod fingerprint;
 mod migrate;
@@ -69,6 +70,7 @@ pub trait Entity: Serialize + DeserializeOwned + 'static {
 /// Support code for the generated items. Not a public API.
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::catalog::stored_source;
     pub use crate::fingerprint::Fp;
     pub use crate::migrate::*;
     pub use crate::store::*;

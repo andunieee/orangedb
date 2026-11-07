@@ -85,6 +85,110 @@ fn everything_survives_a_reopen() {
 }
 
 #[test]
+fn schema_source_is_recorded_with_each_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blog.redb");
+
+    let db = blog::Db::open(&path).unwrap();
+    let source = db.stored_source::<User>().unwrap().unwrap();
+    assert!(source.contains("pub mod schema"), "{source}");
+    // The snapshot is the module as written, doc comments included.
+    assert!(source.contains("/// Deleting a user deletes their posts."), "{source}");
+    assert!(source.contains("#[unique]"), "{source}");
+    // Every entity of the module records the same source at its fingerprint.
+    assert_eq!(db.stored_source::<Post>().unwrap().as_deref(), Some(source.as_str()));
+    assert_eq!(db.stored_source::<Reply>().unwrap().as_deref(), Some(source.as_str()));
+    drop(db);
+
+    let db = blog::Db::open(&path).unwrap();
+    assert_eq!(db.stored_source::<User>().unwrap().as_deref(), Some(source.as_str()));
+}
+
+#[test]
+fn schema_source_of_a_macro_generated_module_is_expanded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shop.redb");
+
+    let db = shop::price_type::Db::open(&path).unwrap();
+    let source = db.stored_source::<shop::price_type::Item>().unwrap().unwrap();
+    assert!(source.contains("pub struct Item"), "{source}");
+    assert!(source.contains("price : u64"), "{source}");
+    // Not the `$item` template that `item_variant!` expanded from.
+    assert!(!source.contains('$'), "{source}");
+}
+
+#[test]
+fn the_catalog_describes_every_table() {
+    use orangedb::Entity;
+    use orangedb::catalog::{IdKind, OnDelete, Shape};
+    use orangedb::redb::{MultimapTableHandle, TableHandle};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blog.redb");
+    let db = blog::Db::open(&path).unwrap();
+    db.users().create(|id| User { id, ..alice() }).unwrap();
+
+    let catalog = db.stored_catalog().unwrap();
+    let names: Vec<&str> = catalog.layouts.iter().map(|l| l.entity.as_str()).collect();
+    assert_eq!(names, ["Post", "Reply", "User"]);
+    assert_eq!(catalog.current["User"], User::FINGERPRINT);
+    assert_eq!(catalog.next_ids["User"], 2);
+    assert!(catalog.layouts.iter().all(|l| catalog.is_current(l)));
+
+    let user = catalog.layout("User", User::FINGERPRINT).unwrap();
+    assert_eq!(user.rows, format!("User@{:016x}", User::FINGERPRINT));
+    assert_eq!(user.id.field, "id");
+    assert_eq!(user.id.ty, "UserId");
+    assert_eq!(user.id.kind, IdKind::Auto);
+    let fields: Vec<(&str, Option<&str>)> = user.fields.iter().map(|f| (f.name.as_str(), f.ty.as_deref())).collect();
+    assert_eq!(
+        fields,
+        [
+            ("id", Some("UserId")),
+            ("email", Some("String")),
+            ("name", Some("String"))
+        ]
+    );
+    assert!(user.references.is_empty());
+    assert_eq!(user.uniques.len(), 1);
+    assert_eq!(user.uniques[0].field, "email");
+    assert_eq!(user.uniques[0].ty, "String");
+    assert_eq!(user.uniques[0].index, format!("{}.email.unique", user.rows));
+
+    let post = catalog.layout("Post", Post::FINGERPRINT).unwrap();
+    assert_eq!(post.id.kind, IdKind::Uuid);
+    let liked_by = &post.references[1];
+    assert_eq!(liked_by.field, "liked_by");
+    assert_eq!(liked_by.shape, Shape::Vec);
+    assert_eq!(liked_by.target, "User");
+    assert_eq!(liked_by.on_delete, OnDelete::SetNull);
+    assert_eq!(liked_by.index, format!("{}.liked_by.fk", post.rows));
+
+    // Every table the catalog names exists.
+    drop(db);
+    let redb = orangedb::redb::Database::open(&path).unwrap();
+    let tx = redb.begin_read().unwrap();
+    let tables: Vec<String> = tx.list_tables().unwrap().map(|t| t.name().to_string()).collect();
+    let multimaps: Vec<String> = tx
+        .list_multimap_tables()
+        .unwrap()
+        .map(|t| t.name().to_string())
+        .collect();
+    for layout in &catalog.layouts {
+        assert!(tables.contains(&layout.rows), "{}", layout.rows);
+        for r in &layout.references {
+            assert!(multimaps.contains(&r.index), "{}", r.index);
+        }
+        for u in &layout.uniques {
+            assert!(tables.contains(&u.index), "{}", u.index);
+        }
+        // The module's source is stored once, for all of its entities.
+        assert!(catalog.source(layout).unwrap().contains("pub mod schema"));
+    }
+    assert_eq!(catalog.sources.len(), 1);
+}
+
+#[test]
 fn rolled_back_writes_are_not_persisted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("blog.redb");

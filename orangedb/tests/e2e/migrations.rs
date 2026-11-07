@@ -320,6 +320,60 @@ fn a_migration_rewrites_the_changed_entities() {
 }
 
 #[test]
+fn migrated_layouts_keep_their_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("forum.redb");
+    seed(&path);
+
+    let db = v2::Db::open(&path).unwrap();
+    let old = db.stored_source::<v1::User>().unwrap().unwrap();
+    let new = db.stored_source::<v2::User>().unwrap().unwrap();
+    assert_ne!(v1::User::FINGERPRINT, v2::User::FINGERPRINT);
+    assert!(old.contains("pub struct Draft"), "{old}");
+    assert!(new.contains("pub struct Name"), "{new}");
+    assert!(!new.contains("pub struct Draft"), "{new}");
+}
+
+#[test]
+fn the_catalog_keeps_migrated_layouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("forum.redb");
+    seed(&path);
+
+    let catalog = v3::Db::open(&path).unwrap().stored_catalog().unwrap();
+    // Every layout the file has been at, current or not.
+    let mut seen: Vec<(&str, u64, bool)> = catalog
+        .layouts
+        .iter()
+        .map(|l| (l.entity.as_str(), l.fingerprint, catalog.is_current(l)))
+        .collect();
+    seen.sort();
+    let mut expected = vec![
+        ("Comment", v1::Comment::FINGERPRINT, false),
+        ("Comment", v2::Comment::FINGERPRINT, true),
+        ("Draft", v1::Draft::FINGERPRINT, false),
+        ("Post", v1::Post::FINGERPRINT, false),
+        ("Post", v3::Post::FINGERPRINT, true),
+        ("User", v1::User::FINGERPRINT, false),
+        ("User", v2::User::FINGERPRINT, true),
+    ];
+    expected.sort();
+    assert_eq!(seen, expected);
+    assert!(!catalog.current.contains_key("Draft"));
+
+    // A migrated layout still knows which module declared it.
+    let draft = catalog.layout("Draft", v1::Draft::FINGERPRINT).unwrap();
+    assert!(catalog.source(draft).unwrap().contains("pub struct Draft"));
+    // A layout several schemas declare records the latest of them: v2 kept
+    // v1's posts, and v3 kept v2's users and comments.
+    let post = catalog.layout("Post", v1::Post::FINGERPRINT).unwrap();
+    assert!(catalog.source(post).unwrap().contains("pub mod v2"));
+    let user = catalog.layout("User", v2::User::FINGERPRINT).unwrap();
+    assert!(catalog.source(user).unwrap().contains("pub mod v3"));
+    assert_eq!(catalog.sources.len(), 3);
+}
+
+#[test]
 fn migrations_chain_and_run_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("forum.redb");

@@ -30,6 +30,9 @@ pub struct Entity {
     pub accessor: Ident,
     pub id: IdField,
     pub fields: Vec<Field>,
+    /// Every field a row stores, the id too, in order, with its type, or
+    /// `None` if it has a `#[fingerprint]` label.
+    pub stored: Vec<(Ident, Option<Type>)>,
     /// A const expression for `Entity::FINGERPRINT`.
     pub fingerprint: TokenStream,
 }
@@ -203,6 +206,7 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
     let mut errors = Errors::default();
     let mut id = None;
     let mut fields = Vec::new();
+    let mut stored = Vec::new();
     let mut fingerprint = Print::new("entity");
     fingerprint.str(print::FORMAT);
     match print::serde_attrs(&s.attrs, false) {
@@ -227,7 +231,9 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
                     "the id's stored format is its key type's, so it can't have a #[fingerprint] label",
                 ));
             }
-            Ok(_) => {}
+            Ok(FieldKind::Typed) => stored.push((ident.clone(), Some(f.ty.clone()))),
+            Ok(FieldKind::Labelled) => stored.push((ident.clone(), None)),
+            Ok(FieldKind::Skipped) => {}
             Err(e) => errors.push(e),
         }
 
@@ -316,6 +322,7 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
         accessor,
         id: id.expect("checked above"),
         fields,
+        stored,
         fingerprint: fingerprint.finish(),
     })
 }
