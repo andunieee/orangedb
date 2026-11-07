@@ -93,19 +93,6 @@ pub fn hex(bytes: &[u8], full: bool) -> String {
     out
 }
 
-fn uuid(bytes: &[u8]) -> Option<String> {
-    let b: &[u8; 16] = bytes.try_into().ok()?;
-    let h = |r: std::ops::Range<usize>| b[r].iter().map(|x| format!("{x:02x}")).collect::<String>();
-    Some(format!(
-        "{}-{}-{}-{}-{}",
-        h(0..4),
-        h(4..6),
-        h(6..8),
-        h(8..10),
-        h(10..16)
-    ))
-}
-
 fn string(s: &str, full: bool) -> String {
     const SHOWN: usize = 80;
     match s.char_indices().nth(SHOWN) {
@@ -145,7 +132,6 @@ fn redb_value(ty: &str, bytes: &[u8], catalog: &Catalog, full: bool) -> Option<S
         let kind = id_kind(catalog, None, |l| l.entity == entity && l.id.field == field)?;
         return match kind {
             IdKind::Auto => redb_value("u64", bytes, catalog, full),
-            IdKind::Uuid => uuid(bytes),
             IdKind::Key(ty) => redb_value(ty, bytes, catalog, full),
         };
     }
@@ -163,7 +149,6 @@ fn redb_value(ty: &str, bytes: &[u8], catalog: &Catalog, full: bool) -> Option<S
             Some(format!("{:?}", char::from_u32(u32::from_le_bytes([a, b, c, 0]))?))
         }
         "&str" | "String" => Some(string(std::str::from_utf8(bytes).ok()?, full)),
-        "uuid::Uuid" | "Uuid" => uuid(bytes),
         _ => None,
     }
 }
@@ -303,10 +288,6 @@ impl<'c> Rows<'c> {
             ("f64", []) => f64::from_le_bytes(r.take(8)?.try_into().unwrap()).to_string(),
             ("char", []) => format!("{:?}", r.str()?.chars().next().ok_or(Stop::Malformed)?),
             ("String" | "str", []) => string(r.str()?, self.full),
-            ("Uuid", []) => {
-                let len = r.len()?;
-                uuid(r.take(len)?).ok_or(Stop::Malformed)?
-            }
             ("Duration", []) => format!("{}.{:09}s", r.varint()?, r.varint()?),
             ("SystemTime", []) => format!("{}.{:09}s after the epoch", r.varint()?, r.varint()?),
             ("PhantomData", _) => "PhantomData".into(),
@@ -333,7 +314,6 @@ impl<'c> Rows<'c> {
                     .ok_or_else(|| Stop::Unknown(name.to_string()))?;
                 match kind {
                     IdKind::Auto => r.varint()?.to_string(),
-                    IdKind::Uuid => self.value(r, &Ty::Path("Uuid".into(), Vec::new()))?,
                     IdKind::Key(key) => self.value(r, &parse(key).ok_or_else(|| Stop::Unknown(key.clone()))?)?,
                 }
             }

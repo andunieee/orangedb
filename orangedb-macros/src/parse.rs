@@ -46,7 +46,6 @@ pub struct IdField {
 
 pub enum IdKind {
     Auto,
-    Uuid,
     Natural(Box<Type>),
 }
 
@@ -54,7 +53,6 @@ impl IdKind {
     pub fn inner(&self) -> Type {
         match self {
             IdKind::Auto => syn::parse_quote!(u64),
-            IdKind::Uuid => syn::parse_quote!(::orangedb::__private::uuid::Uuid),
             IdKind::Natural(ty) => (**ty).clone(),
         }
     }
@@ -254,7 +252,6 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
                     // fingerprint, which is its inner type's.
                     fingerprint.str(match field.kind {
                         IdKind::Auto => "id:auto",
-                        IdKind::Uuid => "id:uuid",
                         IdKind::Natural(_) => "id:key",
                     });
                     id = Some(field);
@@ -308,7 +305,7 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
         None => {
             errors.push(syn::Error::new(
                 s.ident.span(),
-                "missing #[id] field: mark one with #[id(auto)], #[id(uuid)] or #[id(KeyType)]",
+                "missing #[id] field: mark one with #[id(auto)] or #[id(KeyType)]",
             ));
             None
         }
@@ -328,11 +325,10 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
 }
 
 fn id_field(attr: &Attribute, ident: Ident, ty: &Type) -> syn::Result<IdField> {
-    let usage = "expected #[id(auto)], #[id(uuid)] or #[id(KeyType)], e.g. #[id(String)]";
+    let usage = "expected #[id(auto)] or #[id(KeyType)], e.g. #[id(String)]";
     let arg: Type = attr.parse_args().map_err(|e| syn::Error::new(e.span(), usage))?;
     let kind = match &arg {
         Type::Path(p) if p.path.is_ident("auto") => IdKind::Auto,
-        Type::Path(p) if p.path.is_ident("uuid") => IdKind::Uuid,
         _ => IdKind::Natural(Box::new(arg)),
     };
     let Type::Path(p) = ty else {

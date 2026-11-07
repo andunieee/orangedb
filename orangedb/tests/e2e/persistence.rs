@@ -156,7 +156,7 @@ fn the_catalog_describes_every_table() {
     assert_eq!(user.uniques[0].index, format!("{}.email.unique", user.rows));
 
     let post = catalog.layout("Post", Post::FINGERPRINT).unwrap();
-    assert_eq!(post.id.kind, IdKind::Uuid);
+    assert_eq!(post.id.kind, IdKind::Auto);
     let liked_by = &post.references[1];
     assert_eq!(liked_by.field, "liked_by");
     assert_eq!(liked_by.shape, Shape::Vec);
@@ -397,11 +397,11 @@ mod shop {
                 pub price: u32,
             }
         }
-        /// The id switches from auto to uuid.
-        uuid_id {
+        /// The id switches from auto to a natural key.
+        key_id {
             #[entity]
             pub struct Item {
-                #[id(uuid)]
+                #[id(String)]
                 pub id: ItemId,
                 pub name: String,
                 pub price: u32,
@@ -469,7 +469,7 @@ fn schema_changes_that_break_the_layout_are_rejected() {
         ("renamed", shop::renamed::Db::open(&path).err()),
         ("reordered", shop::reordered::Db::open(&path).err()),
         ("made_unique", shop::made_unique::Db::open(&path).err()),
-        ("uuid_id", shop::uuid_id::Db::open(&path).err()),
+        ("key_id", shop::key_id::Db::open(&path).err()),
     ];
     let stored = <shop::v1::Item as orangedb::Entity>::FINGERPRINT;
     for (variant, err) in errors {
@@ -489,7 +489,7 @@ fn schema_changes_that_break_the_layout_are_rejected() {
     // The id's key type is part of `Order`'s fingerprint too, through
     // `ItemId`, so whichever entity is checked first is the one reported.
     #[orangedb::schema]
-    mod uuid_id_order_first {
+    mod key_id_order_first {
         #[entity]
         pub struct Order {
             #[id(auto)]
@@ -500,13 +500,13 @@ fn schema_changes_that_break_the_layout_are_rejected() {
 
         #[entity]
         pub struct Item {
-            #[id(uuid)]
+            #[id(String)]
             pub id: ItemId,
             pub name: String,
             pub price: u32,
         }
     }
-    let err = uuid_id_order_first::Db::open(&path).err().unwrap();
+    let err = key_id_order_first::Db::open(&path).err().unwrap();
     assert!(matches!(err, Error::SchemaMismatch { entity: "Order", .. }), "{err}");
 
     // None of the rejected opens touched the file.

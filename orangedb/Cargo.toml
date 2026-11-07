@@ -10,10 +10,9 @@ readme = "../README.md"
 [dependencies]
 orangedb-macros.workspace = true
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
-redb = { version = "4.4", features = ["uuid"] }
+redb = { version = "4.4" }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
-uuid = { version = "1.18", features = ["v7", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"

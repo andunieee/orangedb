@@ -12,7 +12,7 @@ use redb::{
 use crate::Result;
 
 /// A key or value type whose decoded form is the type itself, with no
-/// borrowed lifetime. Ids, `String`, integers and `Uuid` all qualify.
+/// borrowed lifetime. Ids, `String` and integers all qualify.
 pub trait Owned: Value + 'static + for<'a> Value<SelfType<'a> = Self> {}
 impl<T> Owned for T where T: Value + 'static + for<'a> Value<SelfType<'a> = T> {}
 

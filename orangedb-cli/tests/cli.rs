@@ -61,7 +61,7 @@ pub mod shop {
         /// Orders keep the customers who placed them.
         #[entity]
         pub struct Order {
-            #[id(uuid)]
+            #[id(auto)]
             pub id: OrderId,
             #[references(Customer, on_delete = restrict)]
             pub customer: CustomerId,
@@ -374,7 +374,7 @@ fn dump_reads_indexes_and_other_tables() {
 
     let out = orangedb(&path, &["dump", "__orangedb.meta", "-n", "1"]);
     assert!(
-        out.ends_with("… showing 1 of 4 entries; pass --limit to see more\n"),
+        out.ends_with("… showing 1 of 5 entries; pass --limit to see more\n"),
         "{out}"
     );
 }

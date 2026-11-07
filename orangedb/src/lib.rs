@@ -16,7 +16,7 @@
 //!
 //!     #[entity]
 //!     pub struct Post {
-//!         #[id(uuid)]
+//!         #[id(auto)]
 //!         pub id: PostId,
 //!         #[references(User, on_delete = cascade)]
 //!         pub author: UserId,
@@ -75,7 +75,6 @@ pub mod __private {
     pub use crate::migrate::*;
     pub use crate::store::*;
     pub use serde;
-    pub use uuid;
 
     /// Keeps [`Fingerprint`] to the types orangedb and its macros declare.
     pub trait Sealed {}

@@ -64,8 +64,6 @@ pub struct Field {
 pub enum IdKind {
     /// A `u64` from the entity's sequence.
     Auto,
-    /// A v7 `Uuid`.
-    Uuid,
     /// A caller-supplied key, with its type as written.
     Key(String),
 }
@@ -122,7 +120,6 @@ impl fmt::Display for IdKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IdKind::Auto => f.write_str("auto"),
-            IdKind::Uuid => f.write_str("uuid"),
             IdKind::Key(ty) => f.write_str(ty),
         }
     }

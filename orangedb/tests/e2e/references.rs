@@ -43,7 +43,7 @@ pub mod org {
     #[entity]
     #[derive(Debug, Clone, PartialEq)]
     pub struct Project {
-        #[id(uuid)]
+        #[id(auto)]
         pub id: ProjectId,
         #[references(Company, on_delete = cascade)]
         pub company: CompanySlug,

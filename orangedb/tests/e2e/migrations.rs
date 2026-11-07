@@ -2,7 +2,7 @@
 //! through three schemas:
 //!
 //! - v1: users, posts, threaded comments and drafts.
-//! - v2: user names become structured, comments switch to uuid ids, drafts
+//! - v2: user names become structured, comments switch to string ids, drafts
 //!   are dropped. Posts don't change.
 //! - v3: posts get a unique slug.
 
@@ -82,14 +82,17 @@ pub mod forum {
             }
             // Comments get new ids, and reference each other by them.
             let comments = old.comments().all()?;
-            let ids: HashMap<u64, CommentId> = comments.iter().map(|c| (c.id.0, CommentId::generate())).collect();
+            let ids: HashMap<u64, CommentId> = comments
+                .iter()
+                .map(|c| (c.id.0, CommentId::new(format!("c{}", c.id.0))))
+                .collect();
             // Replies before the comments they reply to: references are only
             // checked once the migration is done.
             for c in comments.into_iter().rev() {
                 new.comments().insert(&Comment {
-                    id: ids[&c.id.0],
+                    id: ids[&c.id.0].clone(),
                     post: PostId(c.post.0),
-                    parent: c.parent.map(|p| ids[&p.0]),
+                    parent: c.parent.map(|p| ids[&p.0].clone()),
                     body: c.body,
                 })?;
             }
@@ -127,7 +130,7 @@ pub mod forum {
         #[entity]
         #[derive(Debug, Clone, PartialEq)]
         pub struct Comment {
-            #[id(uuid)]
+            #[id(String)]
             pub id: CommentId,
             #[references(Post, on_delete = cascade)]
             pub post: PostId,
@@ -186,7 +189,7 @@ pub mod forum {
         #[entity]
         #[derive(Debug, Clone, PartialEq)]
         pub struct Comment {
-            #[id(uuid)]
+            #[id(String)]
             pub id: CommentId,
             #[references(Post, on_delete = cascade)]
             pub post: PostId,
@@ -288,8 +291,8 @@ fn a_migration_rewrites_the_changed_entities() {
     assert_eq!(comments.len(), 2);
     let top = comments.iter().find(|c| c.parent.is_none()).unwrap();
     let reply = comments.iter().find(|c| c.parent.is_some()).unwrap();
-    assert_eq!(reply.parent, Some(top.id));
-    assert_eq!(db.comments().by_parent(top.id).unwrap(), vec![reply.clone()]);
+    assert_eq!(reply.parent, Some(top.id.clone()));
+    assert_eq!(db.comments().by_parent(&top.id).unwrap(), vec![reply.clone()]);
 
     // Sequences carry over: no id is handed out twice.
     assert_eq!(db.users().next_id().unwrap(), v2::UserId(3));

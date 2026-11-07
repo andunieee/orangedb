@@ -33,7 +33,7 @@ pub mod catalog {
     #[entity]
     #[derive(Debug, Clone, PartialEq)]
     pub struct BlogPost {
-        #[id(uuid)]
+        #[id(auto)]
         pub id: BlogPostId,
         #[references(Category, on_delete = set_null)]
         pub tags: Vec<CategorySlug>,
@@ -95,10 +95,10 @@ fn entity_impl() {
 
 #[test]
 fn id_newtypes() {
-    // Auto and uuid ids are Copy; all of them convert from their inner type.
+    // Auto ids are Copy; all of them convert from their inner type.
     fn is_copy<T: Copy>(_: T) {}
     is_copy(LogEntryId(1));
-    is_copy(BlogPostId::generate());
+    is_copy(BlogPostId(1));
     assert_eq!(LogEntryId::from(3), LogEntryId(3));
     assert_eq!(BatchNumber::from(7), BatchNumber::new(7u32));
     assert_eq!(CategorySlug::from("x".to_string()), CategorySlug::new("x"));

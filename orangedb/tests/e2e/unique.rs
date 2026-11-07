@@ -35,7 +35,7 @@ pub mod accounts {
     #[entity]
     #[derive(Debug, Clone, PartialEq)]
     pub struct Session {
-        #[id(uuid)]
+        #[id(auto)]
         pub id: SessionId,
         #[references(Account, on_delete = cascade)]
         pub account: AccountId,

@@ -13,7 +13,7 @@ mod blog {
     #[entity]
     #[derive(Debug, Clone, PartialEq)]
     pub struct Post {
-        #[id(uuid)]
+        #[id(auto)]
         pub id: PostId,
         #[references(User, on_delete = cascade)]
         pub author: UserId,

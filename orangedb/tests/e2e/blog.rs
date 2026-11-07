@@ -19,7 +19,7 @@ pub mod schema {
     #[entity]
     #[derive(Debug, Clone, PartialEq)]
     pub struct Post {
-        #[id(uuid)]
+        #[id(auto)]
         pub id: PostId,
         /// Deleting a user deletes their posts.
         #[references(User, on_delete = cascade)]
@@ -287,36 +287,6 @@ backends!(crate::blog::schema =>
         assert_eq!(user(db, "m").id, UserId(26));
     }
 
-    fn uuid_ids(db) {
-        let alice = user(db, "alice");
-        let posts: Vec<Post> = (0..20).map(|_| post(db, &alice, &[])).collect();
-        // v7 ids are time-ordered, so id order is creation order.
-        assert_eq!(db.posts().all().unwrap(), posts);
-        assert_eq!(posts[0].id.0.get_version_num(), 7);
-
-        // Generated ids can be used for explicit inserts too.
-        let id = PostId::generate();
-        assert_ne!(id, PostId::generate());
-        let explicit = Post {
-            id,
-            author: alice.id,
-            title: "explicit".into(),
-            liked_by: vec![],
-        };
-        db.posts().insert(&explicit).unwrap();
-        assert_eq!(db.posts().get(id).unwrap(), Some(explicit.clone()));
-        assert!(matches!(db.posts().insert(&explicit), Err(Error::AlreadyExists { entity: "Post", .. })));
-
-        // As can any other uuid.
-        let nil = Post {
-            id: PostId::from(orangedb::__private::uuid::Uuid::nil()),
-            ..explicit
-        };
-        db.posts().insert(&nil).unwrap();
-        assert_eq!(db.posts().all().unwrap()[0], nil);
-        assert_eq!(db.posts().len().unwrap(), 22);
-    }
-
     fn indexes_follow_every_write(db) {
         let (alice, bob, carol) = (user(db, "alice"), user(db, "bob"), user(db, "carol"));
         let mut p = post(db, &alice, &[&bob, &carol]);
@@ -376,7 +346,7 @@ backends!(crate::blog::schema =>
             db.posts().update(&dangling_like),
             db.posts().upsert(&dangling_like),
             db.posts().insert(&Post {
-                id: PostId::generate(),
+                id: PostId(999),
                 ..dangling_like.clone()
             }),
         ] {
@@ -392,7 +362,7 @@ backends!(crate::blog::schema =>
             .replies()
             .create(|id| Reply {
                 id,
-                post: PostId::generate(),
+                post: PostId(999),
                 author: alice.id,
                 parent: None,
                 body: "".into(),

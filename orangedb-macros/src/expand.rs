@@ -325,20 +325,11 @@ fn public_items(schema: &Schema, e: &Entity) -> TokenStream {
     let type_name = LitStr::new(&format!("orangedb::{ident}.{id_field}"), ident.span());
 
     let copy = match e.id.kind {
-        IdKind::Auto | IdKind::Uuid => quote!(Copy,),
+        IdKind::Auto => quote!(Copy,),
         IdKind::Natural(_) => quote!(),
     };
     let constructor = match &e.id.kind {
         IdKind::Auto => quote!(),
-        IdKind::Uuid => quote! {
-            impl #id_ty {
-                /// A new time-ordered (v7) UUID, so that recent rows sit
-                /// together in the table.
-                pub fn generate() -> Self {
-                    Self(::orangedb::__private::uuid::Uuid::now_v7())
-                }
-            }
-        },
         IdKind::Natural(_) => quote! {
             impl #id_ty {
                 pub fn new(value: impl ::std::convert::Into<#inner>) -> Self {
@@ -690,7 +681,6 @@ fn methods(schema: &Schema, e: &Entity) -> Vec<Method> {
 
     let fresh_id = match e.id.kind {
         IdKind::Auto => Some(quote!(#id_ty(::orangedb::__private::peek_seq::<#ident>(self.tx)?))),
-        IdKind::Uuid => Some(quote!(#id_ty::generate())),
         IdKind::Natural(_) => None,
     };
     if let IdKind::Auto = e.id.kind {
@@ -940,7 +930,6 @@ fn layout(e: &Entity) -> TokenStream {
     });
     let id_kind = match &e.id.kind {
         IdKind::Auto => quote!(c::IdKind::Auto),
-        IdKind::Uuid => quote!(c::IdKind::Uuid),
         IdKind::Natural(ty) => {
             let ty = type_text(ty);
             quote!(c::IdKind::Key(#ty.into()))

@@ -14,7 +14,7 @@ use crate::__private::Sealed;
 ///
 /// Every field of an entity must implement it, which is how a schema refuses
 /// types whose stored format orangedb can't see. It is implemented for the
-/// std types serde supports, for `Uuid` and for the id newtypes; declare your
+/// std types serde supports and for the id newtypes; declare your
 /// own structs and enums with [`#[orangedb::embed]`](crate::embed). It can't
 /// be implemented by hand.
 ///
@@ -98,7 +98,6 @@ leaf!(
     f32 => "f32",
     f64 => "f64",
     String => "string",
-    uuid::Uuid => "uuid",
     Duration => "duration",
     SystemTime => "system_time",
 );
