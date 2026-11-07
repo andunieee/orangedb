@@ -8,7 +8,9 @@
 
 use std::collections::BTreeSet;
 
-use redb::{Database, MultimapTableHandle, ReadTransaction, ReadableDatabase, TableHandle, WriteTransaction};
+use redb::{
+    Database, MultimapTableHandle, ReadTransaction, ReadableDatabase, ReadableTable, TableHandle, WriteTransaction,
+};
 
 use crate::__private::META;
 use crate::catalog::{self, LAYOUTS, Layout, SOURCES};
@@ -71,6 +73,40 @@ fn stale<S: Schema>(tx: &impl Store) -> Result<Option<(&'static str, u64, u64)>>
     Ok(None)
 }
 
+/// The first stored entity that `S` doesn't declare but that references one
+/// it does. `S` would delete rows without applying that entity's `on_delete`
+/// rules, so it can't open the database until the entity is migrated away.
+/// Undeclared entities that reference none of `S`'s belong to some other
+/// schema and are fine, as are those stored before layouts were recorded,
+/// whose references are unknown.
+fn undeclared<S: Schema>(tx: &WriteTransaction) -> Result<Option<Error>> {
+    let mut stored = Vec::new();
+    for entry in tx.open_table(META)?.iter()? {
+        let (key, value) = entry?;
+        if let Some(entity) = key.value().strip_suffix(".fingerprint") {
+            stored.push((entity.to_string(), value.value()));
+        }
+    }
+    for (entity, fingerprint) in stored {
+        if S::ENTITIES.iter().any(|(name, _)| *name == entity.as_str()) {
+            continue;
+        }
+        let Some(bytes) = tx.get_row(LAYOUTS, &table_prefix(&entity, fingerprint))? else {
+            continue;
+        };
+        for reference in catalog::decode(&bytes)?.references {
+            if let Some(&(target, _)) = S::ENTITIES.iter().find(|(name, _)| *name == reference.target) {
+                return Ok(Some(Error::Undeclared {
+                    entity,
+                    field: reference.field,
+                    target,
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Prepares `db` for schema `S`: creates its tables if the stored schema
 /// matches, migrates it if `S` knows how, and fails otherwise without
 /// changing anything.
@@ -79,21 +115,31 @@ pub fn open<S: Schema>(db: &Database) -> Result<()> {
     create_table(&tx, META)?;
     create_table(&tx, SOURCES)?;
     create_row_table(&tx, LAYOUTS)?;
-    let Some((entity, stored, declared)) = stale::<S>(&tx)? else {
-        S::create_tables(&tx)?;
-        record::<S>(&tx)?;
-        tx.commit()?;
-        return Ok(());
-    };
-    tx.abort()?;
-    if S::migrate(db)? {
-        Ok(())
-    } else {
-        Err(Error::SchemaMismatch {
+    let mismatch = match stale::<S>(&tx)? {
+        Some((entity, stored, declared)) => Error::SchemaMismatch {
             entity,
             stored,
             declared,
-        })
+        },
+        None => match undeclared::<S>(&tx)? {
+            Some(undeclared) => undeclared,
+            None => {
+                S::create_tables(&tx)?;
+                record::<S>(&tx)?;
+                tx.commit()?;
+                return Ok(());
+            }
+        },
+    };
+    tx.abort()?;
+    match S::migrate(db) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(mismatch),
+        // Every declared entity is stored as declared, so a migration that
+        // finds the database at some other schema doesn't apply: the
+        // undeclared entity is the problem to report.
+        Err(Error::SchemaMismatch { .. }) if matches!(mismatch, Error::Undeclared { .. }) => Err(mismatch),
+        Err(e) => Err(e),
     }
 }
 

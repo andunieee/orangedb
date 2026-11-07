@@ -54,6 +54,20 @@ pub enum Error {
         declared: u64,
     },
 
+    #[error(
+        "the database stores {entity}, whose {field} references {target}, but the schema doesn't \
+         declare {entity}: deleting a {target} would leave its references dangling. Declare \
+         {entity}, or drop it with a #[migrate] function"
+    )]
+    Undeclared {
+        entity: String,
+        field: String,
+        target: &'static str,
+    },
+
+    #[error("{entity} has used up its auto-increment ids")]
+    IdsExhausted { entity: &'static str },
+
     #[error("the database's catalog uses format {format}, which this version of orangedb can't read")]
     CatalogFormat { format: u32 },
 

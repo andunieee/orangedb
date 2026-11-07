@@ -270,7 +270,11 @@ let db = v2::Db::open("app.redb")?; // migrates a v1 file, opens a v2 one
   stored schema, opening fails with `Error::SchemaMismatch`.
 
 Adding an entity needs no migration, and neither does opening a database
-with a schema that only declares some of its entities.
+with a schema that only declares some of its entities, as long as none of
+the ones it leaves out reference one it declares: deleting a row would skip
+their `on_delete` rules. Opening then fails with `Error::Undeclared`, unless
+a `#[migrate]` function drops the entity (one that just returns `Ok(())` will
+do, if nothing else changed).
 
 ## Inspecting a database
 

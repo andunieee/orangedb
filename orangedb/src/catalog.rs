@@ -204,7 +204,7 @@ fn encode(layout: &Layout) -> Result<Vec<u8>> {
     postcard::to_extend(layout, bytes).map_err(codec)
 }
 
-fn decode(bytes: &[u8]) -> Result<Layout> {
+pub(crate) fn decode(bytes: &[u8]) -> Result<Layout> {
     let codec = |source| Error::Codec {
         entity: "catalog",
         source,

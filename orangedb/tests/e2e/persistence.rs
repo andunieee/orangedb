@@ -325,7 +325,8 @@ mod shop {
         }
     }
 
-    /// Only `Item` exists here: the stored `Order` is simply ignored.
+    /// Only `Item` exists here. It can't ignore the stored `Order`, which
+    /// references it: deleting an item would skip the order's `restrict`.
     #[orangedb::schema]
     pub mod subset {
         #[entity]
@@ -334,6 +335,62 @@ mod shop {
             pub id: ItemId,
             pub name: String,
             pub price: u32,
+        }
+    }
+
+    /// `Order` dropped with a migration, which is how a schema stops
+    /// declaring an entity that references one it keeps.
+    #[orangedb::schema]
+    pub mod dropped {
+        use super::v1;
+
+        #[entity]
+        pub struct Item {
+            #[id(auto)]
+            pub id: ItemId,
+            pub name: String,
+            pub price: u32,
+        }
+
+        #[migrate]
+        fn drop_orders(_old: &v1::ReadTx, _new: &WriteTx) -> orangedb::Result<()> {
+            // Item's layout didn't change, so its rows stay where they are.
+            Ok(())
+        }
+    }
+
+    /// `Item`'s id field is renamed. `Order` doesn't change, so it keeps its
+    /// index of items, which is keyed by `ItemId`.
+    #[orangedb::schema]
+    pub mod renamed_id {
+        use super::v1;
+
+        #[entity]
+        pub struct Item {
+            #[id(auto)]
+            pub key: ItemId,
+            pub name: String,
+            pub price: u32,
+        }
+
+        #[entity]
+        pub struct Order {
+            #[id(auto)]
+            pub id: OrderId,
+            #[references(Item, on_delete = restrict)]
+            pub item: ItemId,
+        }
+
+        #[migrate]
+        fn rename_id(old: &v1::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
+            for item in old.items().all()? {
+                new.items().insert(&Item {
+                    key: ItemId(item.id.0),
+                    name: item.name,
+                    price: item.price,
+                })?;
+            }
+            Ok(())
         }
     }
 
@@ -443,17 +500,59 @@ fn schema_changes_that_keep_the_layout_are_accepted() {
         let item = db.items().all().unwrap()[0].id;
         db.reviews().create(|id| shop::extended::Review { id, item }).unwrap();
     }
-    {
-        let db = shop::subset::Db::open(&path).unwrap();
-        assert_eq!(db.items().len().unwrap(), 1);
-    }
-    // And back again: the original program still opens it, and its new
-    // tables don't get in the way.
-    let db = shop::v1::Db::open(&path).unwrap();
+    // A schema that doesn't declare an entity referencing one of its own
+    // would delete items without applying that entity's on_delete rule.
+    let err = shop::subset::Db::open(&path).err().unwrap();
+    assert!(
+        matches!(&err, Error::Undeclared { entity, field, target: "Item" } if entity == "Order" && field == "item"),
+        "{err}"
+    );
+    let err = shop::v1::Db::open(&path).err().unwrap();
+    assert!(
+        matches!(&err, Error::Undeclared { entity, .. } if entity == "Review"),
+        "{err}"
+    );
+
+    // The refused opens left the file as it was.
+    let db = shop::extended::Db::open(&path).unwrap();
     assert_eq!(db.items().len().unwrap(), 1);
     assert_eq!(db.orders().len().unwrap(), 1);
+    assert_eq!(db.reviews().len().unwrap(), 1);
     assert!(matches!(
         db.items().delete(db.items().all().unwrap()[0].id),
+        Err(Error::Restricted { .. })
+    ));
+}
+
+#[test]
+fn dropping_a_referencing_entity_takes_a_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shop.redb");
+    seed(&path);
+
+    {
+        let db = shop::dropped::Db::open(&path).unwrap();
+        // Order's restrict went with it.
+        assert!(db.items().delete(shop::dropped::ItemId(1)).unwrap());
+    }
+    let catalog = shop::dropped::Db::open(&path).unwrap().stored_catalog().unwrap();
+    assert_eq!(catalog.current.keys().collect::<Vec<_>>(), ["Item"]);
+    // With Order gone, a subset schema has nothing to trip over.
+    shop::subset::Db::open(&path).unwrap();
+}
+
+#[test]
+fn renaming_a_referenced_id_field_migrates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shop.redb");
+    seed(&path);
+
+    let db = shop::renamed_id::Db::open(&path).unwrap();
+    assert_eq!(db.items().all().unwrap()[0].key, shop::renamed_id::ItemId(1));
+    let orders = db.orders().by_item(shop::renamed_id::ItemId(1)).unwrap();
+    assert_eq!(orders.len(), 1);
+    assert!(matches!(
+        db.items().delete(shop::renamed_id::ItemId(1)),
         Err(Error::Restricted { .. })
     ));
 }

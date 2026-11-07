@@ -127,9 +127,10 @@ fn redb_value(ty: &str, bytes: &[u8], catalog: &Catalog, full: bool) -> Option<S
         };
     }
     int!(u8 u16 u32 u64 u128 i8 i16 i32 i64 i128);
-    // `orangedb::Entity.field`: an id, stored as the key it wraps.
-    if let Some((entity, field)) = ty.strip_prefix("orangedb::").and_then(|t| t.split_once('.')) {
-        let kind = id_kind(catalog, None, |l| l.entity == entity && l.id.field == field)?;
+    // `orangedb::Entity.id`: an id, stored as the key it wraps. Older files
+    // name the id field instead of `id`, which doesn't matter here.
+    if let Some((entity, _)) = ty.strip_prefix("orangedb::").and_then(|t| t.split_once('.')) {
+        let kind = id_kind(catalog, None, |l| l.entity == entity)?;
         return match kind {
             IdKind::Auto => redb_value("u64", bytes, catalog, full),
             IdKind::Key(ty) => redb_value(ty, bytes, catalog, full),

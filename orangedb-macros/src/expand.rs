@@ -322,7 +322,11 @@ fn public_items(schema: &Schema, e: &Entity) -> TokenStream {
     let table = format_ident!("{}Table", ident);
     let auto = format_ident!("{}AutoTable", ident);
     let accessor = &e.accessor;
-    let type_name = LitStr::new(&format!("orangedb::{ident}.{id_field}"), ident.span());
+    // Named after the entity alone. Other entities' index tables are keyed
+    // by this type, and their fingerprints only see the entity's name and
+    // key type: a name with the id field in it would change under them when
+    // the field is renamed, and redb would refuse to open those tables.
+    let type_name = LitStr::new(&format!("orangedb::{ident}.id"), ident.span());
 
     let copy = match e.id.kind {
         IdKind::Auto => quote!(Copy,),

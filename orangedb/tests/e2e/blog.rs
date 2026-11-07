@@ -285,6 +285,27 @@ backends!(crate::blog::schema =>
                 .is_err()
         );
         assert_eq!(user(db, "m").id, UserId(26));
+
+        // The sequence can't move past u64::MAX, so that id is refused
+        // rather than wrapping the sequence around to ids already in use.
+        let max = |email: &str| User {
+            id: UserId(u64::MAX),
+            email: email.into(),
+            name: "max".into(),
+        };
+        for result in [db.users().insert(&max("n@example.com")), db.users().upsert(&max("o@example.com"))] {
+            assert!(matches!(result, Err(Error::IdsExhausted { entity: "User" })), "{result:?}");
+        }
+        assert!(!db.users().contains(UserId(u64::MAX)).unwrap());
+        db.users()
+            .insert(&User {
+                id: UserId(u64::MAX - 1),
+                email: "p@example.com".into(),
+                name: "p".into(),
+            })
+            .unwrap();
+        assert!(matches!(db.users().next_id(), Err(Error::IdsExhausted { entity: "User" })));
+        assert!(db.users().create(|id| User { id, email: "q@example.com".into(), name: "q".into() }).is_err());
     }
 
     fn indexes_follow_every_write(db) {
