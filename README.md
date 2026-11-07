@@ -1,6 +1,6 @@
 # orangedb
 
-Indexing layer for structs with foreign keys and unique constraints on top of [redb].
+Indexing layer for structs with foreign keys, unique constraints and computed indexes on top of [redb].
 
 You declare a schema as a module of plain structs. The `#[orangedb::schema]`
 macro turns it into a `Db` type with one typed table handle per entity. Every
@@ -43,6 +43,7 @@ pub mod bistro {
 
     #[entity]
     #[derive(Debug, Clone, PartialEq)]
+    #[index(table_at: (TableId, u64) = |r| (r.table, r.at))]
     pub struct Reservation {
         #[id(auto)]
         pub id: ReservationId,
@@ -68,6 +69,7 @@ pub mod bistro {
         #[references(Reservation, on_delete = set_null)]
         pub reservation: Option<ReservationId>,
         pub items: Vec<String>,
+        #[index]
         pub open: bool,
     }
 }
@@ -130,7 +132,19 @@ db.reservations().by_table(table.id)?;      // Vec<Reservation>
 db.orders().by_table(table.id)?;            // Vec<Order>, all orders on one table
 db.orders().by_waiter(sam.id)?;             // Vec<Order>, every order Sam owns
 db.reservations().by_waiter(sam.id)?;       // Vec<Reservation>
+db.orders().by_open(true)?;                 // Vec<Order>, from #[index]
+
+// Table 12's reservations from a time on, in time order, from the computed index.
+db.reservations().range_by_table_at((table.id, 1_790_000_000)..(table.id, u64::MAX))?;
 ```
+
+`#[index]` indexes a field's value, `#[unique]` does the same and also
+rejects duplicates, and `#[index(name: Key = expr)]` on the struct indexes
+whatever the expression computes from the row. The expression returns the
+key, an `Option` of it or a `Vec` of them, and must depend on nothing but the
+row. Each index gets `by_name`, and `range_by_name` for any range of keys;
+the non-unique ones also get `ids_by_name`. Keys are redb key types, so
+tuples work and sort by their parts.
 
 A table is active while it has an open order, so filter `by_table(...)` on
 `Order::open` to find the tables currently in service.
@@ -156,7 +170,9 @@ A delete works out the whole cascade before it writes anything. If a
 | `#[id(auto)]` | field | A `u64` id from a per-table sequence. |
 | `#[id(Type)]` | field | A key you supply, of any owned redb key type (`String`, `u32`, …). |
 | `#[references(Entity, on_delete = …)]` | `EntityId`, `Option<EntityId>` or `Vec<EntityId>` field | A foreign key plus a `by_field` index. `on_delete` is `restrict` (the default), `cascade` or `set_null`. |
-| `#[unique]` | field of a redb key type, or an `Option` of one | Rejects duplicate values and adds a `by_field` lookup. |
+| `#[unique]` | field of a redb key type, or an `Option` or `Vec` of one | Rejects duplicate values and adds `by_field` and `range_by_field` lookups. |
+| `#[index]` | field of a redb key type, or an `Option` or `Vec` of one | Adds `by_field`, `ids_by_field` and `range_by_field` lookups. |
+| `#[index(name: Key = expr)]` | struct | An index of keys computed from each row, see [Query](#query). Options: `unique`, and `fingerprint = "label"`, to change when a function the expression calls changes what it returns. |
 | `#[embed]` / `#[orangedb::embed]` | struct or enum | A type entities can store in a field. `#[embed]` inside the schema module, `#[orangedb::embed]` anywhere else. |
 | `#[fingerprint = "label"]` | field | Declares the stored format of a field whose type has no fingerprint, e.g. one stored with `#[serde(with = ...)]`. Change the label when the format changes. |
 | `#[migrate]` | fn in the schema module | Migrates a database from the previous schema, see below. |
@@ -200,10 +216,18 @@ how they were written (`skip_serializing_if`, ...) are rejected.
 Each entity has a fingerprint, computed at compile time from everything that
 decides how its rows are stored and indexed: field names, order and types
 (through the fingerprints of embedded types, all the way down), enum variants,
-the serde attributes that change the encoding, the id kind and key type,
-references and unique fields. `on_delete`, docs, derives and accessors don't
-count. The database records each entity's fingerprint, and it is the
-entity's version: there is no number to bump.
+the serde attributes that change the encoding, the id kind and key type, and
+references. `on_delete`, docs, derives, accessors and indexes don't count.
+The database records each entity's fingerprint, and it is the entity's
+version: there is no number to bump.
+
+Indexes, unique or not, have fingerprints of their own, in the names of their
+tables: of the field, or of the expression's tokens and key type. Opening a
+database builds the index tables it doesn't have from the rows and drops the
+ones the schema doesn't declare, so adding, changing or removing an index
+needs no migration, and reopening with the same indexes builds nothing. If a
+new unique index finds a duplicate, opening fails with `Error::Unique` and
+changes nothing.
 
 Opening a database that stores a different fingerprint runs the schema's
 `#[migrate]` function, which names the previous schema by its first argument.
@@ -280,7 +304,7 @@ do, if nothing else changed).
 
 Opening a database records a catalog next to the fingerprints: for every
 entity layout, the tables its rows and indexes live in, its id, stored
-fields, references and unique fields, and the source of the schema module
+fields, references and indexes, and the source of the schema module
 that declared it. Layouts the database was migrated away from stay in the
 catalog, so it is also the file's schema history. Read it with
 `db.stored_catalog()?`, or just the source with
@@ -302,12 +326,12 @@ types:
 
 ```sh
 cargo install orangedb-cli
-orangedb shop.redb                   # entities: ids, rows, references, unique fields
+orangedb shop.redb                   # entities: ids, rows, references, indexes
 orangedb shop.redb source --all      # the schema source of every layout
 orangedb shop.redb history           # every layout, current or migrated away from
 orangedb shop.redb tables            # every redb table, its types, entries and owner
 orangedb shop.redb refs Customer     # foreign keys from or to Customer
-orangedb shop.redb indexes           # foreign key and unique index tables
+orangedb shop.redb indexes           # foreign key, unique and plain index tables
 orangedb shop.redb count             # rows per entity
 orangedb shop.redb dump Customer     # rows, decoded as far as the recorded types allow
 orangedb shop.redb dump Order.customer   # an index, or any table by name

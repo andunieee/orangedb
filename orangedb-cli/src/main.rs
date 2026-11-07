@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use orangedb::catalog::{Catalog, Layout, Shape};
+use orangedb::catalog::{Catalog, Index, Indexed, Layout, Shape};
 use orangedb::redb::{MultimapTableHandle, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, TableHandle};
 
 use crate::decode::Rows;
@@ -28,8 +28,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Each entity at its current layout: id, rows, references and unique
-    /// fields. The default.
+    /// Each entity at its current layout: id, rows, references and
+    /// indexes. The default.
     Entities,
     /// The schema source recorded for each layout.
     Source {
@@ -56,7 +56,7 @@ enum Command {
         /// Only references from or to this entity.
         entity: Option<String>,
     },
-    /// Foreign key and unique index tables, with their entries.
+    /// Foreign key, unique and plain index tables, with their entries.
     Indexes {
         /// Only indexes of this entity.
         entity: Option<String>,
@@ -64,7 +64,8 @@ enum Command {
     /// Entries of a table, decoded as far as the catalog's types allow.
     Dump {
         /// An entity (its rows), `Entity@fingerprint` (rows of that layout),
-        /// `Entity.field` (that field's index) or any table's name.
+        /// `Entity.field` (a reference's or index's table) or any table's
+        /// name.
         target: String,
         /// Show at most this many entries.
         #[arg(long, short = 'n', default_value_t = 20)]
@@ -138,6 +139,15 @@ fn header(cells: &[&str]) -> Vec<String> {
 
 fn fp(fingerprint: u64) -> String {
     format!("{fingerprint:016x}")
+}
+
+/// `unique String`, `index Option<u32>`, `index char = #[index(...)]`.
+fn index_kind(index: &Index) -> String {
+    let kind = if index.unique { "unique" } else { "index" };
+    match &index.on {
+        Indexed::Field { shape, .. } => format!("{kind} {}", shaped(*shape, &index.ty)),
+        Indexed::Expr(written) => format!("{kind} {} = {written}", index.ty),
+    }
 }
 
 fn shaped(shape: Shape, target: &str) -> String {
@@ -224,12 +234,8 @@ impl Ctx {
                     r.index.clone(),
                 ]);
             }
-            for u in &layout.uniques {
-                lines.push(vec![
-                    format!("  {}", u.field),
-                    format!("unique {}", shaped(u.shape, &u.ty)),
-                    u.index.clone(),
-                ]);
+            for i in &layout.indexes {
+                lines.push(vec![format!("  {}", i.name), index_kind(i), i.table.clone()]);
             }
             print_table(&lines);
         }
@@ -322,9 +328,10 @@ impl Ctx {
                     return format!("{}.{} -> {} index{stale}", layout.entity, r.field, r.target);
                 }
             }
-            for u in &layout.uniques {
-                if u.index == name {
-                    return format!("{}.{} unique index{stale}", layout.entity, u.field);
+            for i in &layout.indexes {
+                if i.table == name {
+                    let kind = if i.unique { "unique index" } else { "index" };
+                    return format!("{}.{} {kind}{stale}", layout.entity, i.name);
                 }
             }
         }
@@ -398,7 +405,7 @@ impl Ctx {
             Some(entity) => vec![self.layout(entity)?],
             None => self.current()?,
         };
-        let mut rows = vec![header(&["INDEX", "KIND", "FIELD", "ENTRIES"])];
+        let mut rows = vec![header(&["INDEX", "KIND", "NAME", "ENTRIES"])];
         for layout in layouts {
             for r in &layout.references {
                 rows.push(vec![
@@ -408,12 +415,12 @@ impl Ctx {
                     self.len(&r.index, true)?.to_string(),
                 ]);
             }
-            for u in &layout.uniques {
+            for i in &layout.indexes {
                 rows.push(vec![
-                    u.index.clone(),
-                    "unique".into(),
-                    format!("{}.{}", layout.entity, u.field),
-                    self.len(&u.index, false)?.to_string(),
+                    i.table.clone(),
+                    index_kind(i),
+                    format!("{}.{}", layout.entity, i.name),
+                    self.len(&i.table, !i.unique)?.to_string(),
                 ]);
             }
         }
@@ -440,10 +447,10 @@ impl Ctx {
             if let Some(r) = layout.references.iter().find(|r| r.field == field) {
                 return Ok((r.index.clone(), true, None));
             }
-            if let Some(u) = layout.uniques.iter().find(|u| u.field == field) {
-                return Ok((u.index.clone(), false, None));
+            if let Some(i) = layout.indexes.iter().find(|i| i.name == field) {
+                return Ok((i.table.clone(), !i.unique, None));
             }
-            return Err(format!("{entity}.{field} is neither a reference nor a unique field").into());
+            return Err(format!("{entity}.{field} is neither a reference nor an index").into());
         }
         let layout = self.layout(target)?;
         if !self.catalog.is_current(layout) {

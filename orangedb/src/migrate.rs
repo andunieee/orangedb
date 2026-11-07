@@ -5,6 +5,10 @@
 //! the tables of an old and a new layout live side by side while a migration
 //! copies rows from one to the other. Entities whose fingerprint didn't
 //! change keep their tables.
+//!
+//! Indexes other than foreign keys aren't part of the fingerprint: each has
+//! a fingerprint of its own in its table's name, and opening a database
+//! builds the index tables it doesn't find from the rows.
 
 use std::collections::BTreeSet;
 
@@ -31,7 +35,10 @@ pub trait Schema {
     /// layouts record for [`Schema::SOURCE`].
     fn layouts(source: u64) -> Vec<Layout>;
 
-    /// Creates every table of the schema that doesn't exist yet.
+    /// Creates every table of the schema that doesn't exist yet, fills the
+    /// index tables among them from the rows already stored, and drops index
+    /// tables the schema doesn't declare. Fails if a new unique index finds
+    /// a duplicate.
     fn create_tables(tx: &WriteTransaction) -> Result<()>;
 
     /// Checks every reference and unique value, after a migration wrote rows
@@ -196,6 +203,24 @@ fn drop_tables(tx: &WriteTransaction, entity: &str, fingerprint: u64) -> Result<
     Ok(())
 }
 
+/// Drops the tables of `entity` at `fingerprint` other than its rows and the
+/// tables in `keep`: index tables of an index the schema no longer declares,
+/// or declares differently. Keeping them would leave indexes that nothing
+/// updates, and a schema that declares them again would trust them.
+pub fn drop_other_tables(tx: &WriteTransaction, entity: &str, fingerprint: u64, keep: &[&str]) -> Result<()> {
+    let prefix = format!("{}.", table_prefix(entity, fingerprint));
+    let stale = |name: &str| name.starts_with(&prefix) && !keep.contains(&name);
+    let tables: Vec<_> = tx.list_tables()?.filter(|t| stale(t.name())).collect();
+    for table in tables {
+        tx.delete_table(table)?;
+    }
+    let tables: Vec<_> = tx.list_multimap_tables()?.filter(|t| stale(t.name())).collect();
+    for table in tables {
+        tx.delete_multimap_table(table)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn table_prefix(entity: &str, fingerprint: u64) -> String {
     format!("{entity}@{fingerprint:016x}")
 }
@@ -204,16 +229,36 @@ pub(crate) fn table_prefix(entity: &str, fingerprint: u64) -> String {
 /// table definitions can stay `const`. `N` is the length of the result.
 pub const fn table_name<const N: usize>(entity: &str, fingerprint: u64, suffix: &str) -> [u8; N] {
     let mut out = [0u8; N];
-    let mut i = 0;
-    let entity = entity.as_bytes();
-    let mut j = 0;
-    while j < entity.len() {
-        out[i] = entity[j];
-        i += 1;
-        j += 1;
-    }
-    out[i] = b'@';
-    i += 1;
+    let mut i = push_layout(&mut out, 0, entity, fingerprint);
+    i = push(&mut out, i, suffix);
+    assert!(i == N, "table name length mismatch");
+    out
+}
+
+/// `{entity}@{fingerprint:016x}.{index}@{index_fingerprint:016x}{suffix}`:
+/// an index table. It belongs to the entity's layout like its other tables,
+/// and its own fingerprint changes whenever what it indexes does, so that a
+/// changed index starts out as a new, empty table.
+pub const fn index_table_name<const N: usize>(
+    entity: &str,
+    fingerprint: u64,
+    index: &str,
+    index_fingerprint: u64,
+    suffix: &str,
+) -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut i = push_layout(&mut out, 0, entity, fingerprint);
+    i = push(&mut out, i, ".");
+    i = push_layout(&mut out, i, index, index_fingerprint);
+    i = push(&mut out, i, suffix);
+    assert!(i == N, "table name length mismatch");
+    out
+}
+
+/// Writes `{name}@{fingerprint:016x}` at `i` and returns where it ends.
+const fn push_layout(out: &mut [u8], mut i: usize, name: &str, fingerprint: u64) -> usize {
+    i = push(out, i, name);
+    i = push(out, i, "@");
     let mut nibble = 0;
     while nibble < 16 {
         let digit = ((fingerprint >> (60 - 4 * nibble)) & 0xf) as u8;
@@ -221,15 +266,18 @@ pub const fn table_name<const N: usize>(entity: &str, fingerprint: u64, suffix: 
         i += 1;
         nibble += 1;
     }
-    let suffix = suffix.as_bytes();
-    j = 0;
-    while j < suffix.len() {
-        out[i] = suffix[j];
+    i
+}
+
+const fn push(out: &mut [u8], mut i: usize, s: &str) -> usize {
+    let s = s.as_bytes();
+    let mut j = 0;
+    while j < s.len() {
+        out[i] = s[j];
         i += 1;
         j += 1;
     }
-    assert!(i == N, "table name length mismatch");
-    out
+    i
 }
 
 pub const fn utf8(bytes: &[u8]) -> &str {

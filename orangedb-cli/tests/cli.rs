@@ -43,6 +43,7 @@ pub mod shop {
         }
 
         #[entity]
+        #[index(domain: String = |c| c.email.rsplit('@').next().unwrap_or_default().to_string())]
         pub struct Customer {
             #[id(auto)]
             pub id: CustomerId,
@@ -200,13 +201,16 @@ fn entities_describe_the_current_layouts() {
         format!("Customer @{:016x}: 2 rows", v2::Customer::FINGERPRINT)
     );
     assert_eq!(cells(line(&out, "id  ")), ["id", "id auto, next 3", customer.as_str()]);
-    assert_eq!(
-        cells(line(&out, "nickname")),
-        [
-            "nickname",
-            "unique Option<String>",
-            &format!("{customer}.nickname.unique")
-        ]
+    let nickname = cells(line(&out, "nickname"));
+    assert_eq!(nickname[..2], ["nickname", "unique Option<String>"]);
+    assert!(
+        nickname[2].starts_with(&format!("{customer}.nickname@")) && nickname[2].ends_with(".unique"),
+        "{out}"
+    );
+    let domain = line(&out, "domain");
+    assert!(
+        domain.contains("index String = #[index(domain: String = |c| c.email.rsplit('@')"),
+        "{out}"
     );
     assert_eq!(
         cells(line(&out, "gift_for")),
@@ -232,7 +236,7 @@ fn source_prints_each_module_once() {
     assert!(out.starts_with("// Customer@"), "{out}");
     assert!(out.contains("/// Orders keep the customers who placed them."), "{out}");
     // Nested in `shop`, but printed as if it weren't.
-    assert!(out.contains("\n    #[entity]\n    pub struct Customer {"), "{out}");
+    assert!(out.contains("\n    #[entity]\n    #[index(domain: String"), "{out}");
     assert!(!out.contains("pub mod v1"), "{out}");
 
     let all = orangedb(&path, &["source", "--all"]);
@@ -322,11 +326,11 @@ fn count_refs_and_indexes() {
     assert_eq!(orangedb(&path, &["refs", "Sku"]).lines().count(), 2);
 
     let indexes = orangedb(&path, &["indexes", "Customer"]);
-    assert_eq!(
-        cells(line(&indexes, "Customer@"))[1..],
-        ["unique", "Customer.email", "2"]
-    );
-    assert_eq!(indexes.lines().count(), 3, "{indexes}");
+    let email = indexes.lines().find(|l| l.contains(".email@")).unwrap();
+    assert_eq!(cells(email)[1..], ["unique String", "Customer.email", "2"]);
+    let domain = indexes.lines().find(|l| l.contains(".domain@")).unwrap();
+    assert_eq!(cells(domain)[2..], ["Customer.domain", "2"]);
+    assert_eq!(indexes.lines().count(), 4, "{indexes}");
 }
 
 #[test]
@@ -361,10 +365,17 @@ fn dump_reads_indexes_and_other_tables() {
     let (_dir, path) = fixture();
     let out = orangedb(&path, &["dump", "Customer.email"]);
     assert!(
-        out.starts_with("Customer@") && out.contains(".email.unique (String -> orangedb::Customer.id)\n"),
+        out.starts_with("Customer@")
+            && out.contains(".email@")
+            && out.contains(".unique (String -> orangedb::Customer.id)\n"),
         "{out}"
     );
     assert_eq!(cells(line(&out, "\"ada@")), ["\"ada@example.com\"", "1"]);
+
+    // A plain index is a multimap, from a key to every id that has it.
+    let out = orangedb(&path, &["dump", "Customer.domain"]);
+    assert!(out.contains(".index (String -> orangedb::Customer.id)\n"), "{out}");
+    assert_eq!(cells(line(&out, "\"example.com\"")), ["\"example.com\"", "[1, 2]"]);
 
     let out = orangedb(&path, &["dump", "Order.gift_for"]);
     assert!(cells(out.lines().nth(1).unwrap())[0] == "1", "{out}");
@@ -389,7 +400,7 @@ fn mistakes_are_explained() {
     );
     let err = fails(&path, &["dump", "Customer.vip"]);
     assert!(
-        err.contains("Customer.vip is neither a reference nor a unique field"),
+        err.contains("Customer.vip is neither a reference nor an index"),
         "{err}"
     );
     let old = rows("Customer", shop::v1::Customer::FINGERPRINT);

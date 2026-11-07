@@ -61,15 +61,47 @@ use syn::{Item, ItemMod, parse_macro_input};
 /// `on_delete` is `restrict` (the default), `cascade` or `set_null`, which
 /// sets an `Option` to `None` or removes the id from a `Vec`.
 ///
-/// # Unique fields
+/// # Indexes
 ///
-/// `#[unique]` on a field of a redb key type (or an `Option` of one) rejects
-/// duplicate values and adds a `by_field(value)` lookup.
+/// `#[index]` on a field of a redb key type, or an `Option` or `Vec` of one,
+/// indexes its value, the `Some` or each element. `by_field(value)` returns
+/// the rows that hold `value` in id order, `ids_by_field(value)` their ids,
+/// and `range_by_field(range)` the rows whose value falls in a range, in key
+/// order. `#[unique]` does the same but rejects a value another row already
+/// holds, and its `by_field(value)` returns an `Option`.
+///
+/// An index on the struct computes its keys:
+///
+/// ```ignore
+/// #[entity]
+/// #[index(email_lower: String = |u| u.email.to_lowercase(), unique)]
+/// #[index(tag: String = |u| u.tags.iter().map(|t| t.to_lowercase()).collect::<Vec<_>>())]
+/// #[index(country_age: (String, u8) = |u| (u.country.clone(), u.age))]
+/// pub struct User { /* ... */ }
+/// ```
+///
+/// The expression takes `&Entity` and returns the key type, an `Option` of
+/// it (no key) or a `Vec` of it (any number of keys); it is a closure or the
+/// path of a function. It must depend on nothing but the row, since a write
+/// recomputes the old row's keys to remove them. A tuple key orders by its
+/// parts, so `range_by_country_age(("FR".into(), 0)..("FR".into(), 30))`
+/// finds the French users under 30, youngest first.
+///
+/// Indexes aren't part of the fingerprint. Each has a fingerprint of its
+/// own, of what it indexes and how: for a computed index, the expression's
+/// tokens and the key type. Opening a database builds an index it doesn't
+/// have yet from the rows (failing with `Error::Unique` if a unique one
+/// finds a duplicate, and changing nothing), and drops the index tables the
+/// schema doesn't declare. So adding, changing or removing an index needs no
+/// migration, and reopening with the same indexes builds nothing. The macro
+/// can't see into the functions the expression calls: when one of them
+/// changes the keys it returns, add or change a label with
+/// `#[index(..., fingerprint = "2")]` to have the index rebuilt.
 ///
 /// # Fingerprints and migrations
 ///
-/// Each entity has a fingerprint of how its rows are stored and indexed,
-/// which the database records. Opening a database that stores a different
+/// Each entity has a fingerprint of how its rows are stored and how they
+/// reference others, which the database records. Opening a database that stores a different
 /// fingerprint for an entity runs the schema's `#[migrate]` function, or
 /// fails with `Error::SchemaMismatch` if it has none:
 ///
@@ -100,7 +132,7 @@ use syn::{Item, ItemMod, parse_macro_input};
 /// schema's own `#[migrate]` function runs first.
 ///
 /// The database also records a catalog of each entity's layout (its tables,
-/// fields, references and unique fields) and this module's source, which
+/// fields, references and indexes) and this module's source, which
 /// `Db::stored_catalog()`, `Db::stored_source::<Entity>()` and the `orangedb`
 /// command-line tool read. Neither is used to decide compatibility, and
 /// `#[orangedb::embed]` types declared outside the module are not part of

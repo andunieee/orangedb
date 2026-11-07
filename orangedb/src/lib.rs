@@ -59,9 +59,10 @@ pub trait Entity: Serialize + DeserializeOwned + 'static {
     const NAME: &'static str;
     /// A hash of everything that decides how rows are stored and indexed:
     /// field names, order and types (through their own [`Fingerprint`]s),
-    /// serde attributes that change the encoding, the id kind, references
-    /// and unique fields. It acts as the entity's version: a database that
-    /// stores a different one has to be migrated.
+    /// serde attributes that change the encoding, the id kind and
+    /// references. It acts as the entity's version: a database that stores
+    /// a different one has to be migrated. Unique and plain indexes aren't
+    /// part of it: opening a database builds the ones it lacks.
     const FINGERPRINT: u64;
 
     fn id(&self) -> &Self::Id;
@@ -95,6 +96,53 @@ pub mod __private {
             entity: E::NAME,
             source,
         })
+    }
+
+    /// Compiles only for types an index can use as its key.
+    #[diagnostic::on_unimplemented(
+        message = "`{Self}` can't be an index key",
+        label = "not a redb key type",
+        note = "index keys are redb key types: integers, `bool`, `char`, `String`, ids, \
+                and `Option`s, tuples and arrays of those"
+    )]
+    pub trait IndexKey: OwnedKey {}
+    impl<K: OwnedKey> IndexKey for K {}
+
+    pub fn index_key<K: IndexKey>() {}
+
+    /// What an `#[index(name: K = expr)]` expression returns: one key, an
+    /// optional one, or any number of them.
+    #[diagnostic::on_unimplemented(
+        message = "an index of `{K}` keys can't use a `{Self}`",
+        label = "the index expression returns this",
+        note = "an index expression returns its key type `{K}`, an `Option<{K}>` or a `Vec<{K}>`"
+    )]
+    pub trait IndexKeys<K> {
+        fn into_keys(self) -> Vec<K>;
+    }
+
+    impl<K: OwnedKey> IndexKeys<K> for K {
+        fn into_keys(self) -> Vec<K> {
+            vec![self]
+        }
+    }
+
+    impl<K: OwnedKey> IndexKeys<K> for Option<K> {
+        fn into_keys(self) -> Vec<K> {
+            self.into_iter().collect()
+        }
+    }
+
+    impl<K: OwnedKey> IndexKeys<K> for Vec<K> {
+        fn into_keys(self) -> Vec<K> {
+            self
+        }
+    }
+
+    /// The keys `index` gives `row`. Taking the expression as an argument
+    /// with this bound is what lets a closure leave its parameter's type out.
+    pub fn index_keys<E, K, R: IndexKeys<K>>(index: impl FnOnce(&E) -> R, row: &E) -> Vec<K> {
+        index(row).into_keys()
     }
 
     pub fn fmt_id(id: &impl Debug) -> String {

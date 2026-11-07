@@ -1,10 +1,11 @@
-//! Migrations whose rows keep their layout and only gain or lose indexes.
-//! A shop goes from no indexes, to a unique `sku` and a foreign key from
-//! orders to items, and back to no indexes.
+//! Schema changes whose rows keep their layout and only gain or lose
+//! indexes. A shop goes from no indexes, to a unique `sku` and a foreign key
+//! from orders to items, and back to no indexes.
 //!
-//! An index is part of the fingerprint, so each step needs a migration that
-//! copies the rows. The writes rebuild the indexes and the end of the
-//! migration checks every reference.
+//! A unique index isn't part of the fingerprint: `Item` keeps its layout and
+//! opening the database builds or drops its index. A reference is, so each
+//! step migrates `Order` by copying its rows. The writes rebuild its index
+//! and the end of the migration checks every reference.
 
 use std::path::Path;
 
@@ -38,20 +39,14 @@ pub mod shop {
     pub mod indexed {
         use super::plain;
 
+        /// Items keep their layout, so only orders are copied.
         #[migrate]
         fn from_plain(old: &plain::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
-            // Orders first, before the items they reference exist.
             for order in old.orders().all()? {
                 new.orders().insert(&Order {
                     id: OrderId(order.id.0),
                     item: ItemId(order.item),
                     quantity: order.quantity,
-                })?;
-            }
-            for item in old.items().all()? {
-                new.items().insert(&Item {
-                    id: ItemId(item.id.0),
-                    sku: item.sku,
                 })?;
             }
             Ok(())
@@ -84,12 +79,6 @@ pub mod shop {
 
         #[migrate]
         fn from_indexed(old: &indexed::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
-            for item in old.items().all()? {
-                new.items().insert(&Item {
-                    id: ItemId(item.id.0),
-                    sku: item.sku,
-                })?;
-            }
             for order in old.orders().all()? {
                 new.orders().insert(&Order {
                     id: OrderId(order.id.0),
@@ -139,14 +128,20 @@ fn seed(path: &Path, skus: &[&str], orders: &[u64]) {
 
 /// The names of the index tables, with fingerprints taken out. The database
 /// must be closed.
-fn index_tables(path: &Path) -> Vec<String> {
+pub fn index_tables(path: &Path) -> Vec<String> {
     table_names(path)
         .into_iter()
-        .filter_map(|n| {
-            let (entity, rest) = n.split_once('@')?;
-            let index = &rest[16..];
-            (!index.is_empty()).then(|| format!("{entity}{index}"))
+        .filter(|n| !n.starts_with("__orangedb."))
+        .map(|n| {
+            // `@` and 16 hex digits after the entity, and after an index.
+            let mut parts = n.split('@');
+            let mut out = parts.next().unwrap().to_string();
+            for part in parts {
+                out.push_str(&part[16..]);
+            }
+            out
         })
+        .filter(|n| n.contains('.'))
         .collect()
 }
 
@@ -157,8 +152,8 @@ fn a_migration_can_add_indexes() {
     seed(&path, &["lamp", "desk"], &[1, 1, 2]);
     assert!(index_tables(&path).is_empty());
 
-    // Only the indexes differ, and that is enough to need a migration.
-    assert_ne!(plain::Item::FINGERPRINT, indexed::Item::FINGERPRINT);
+    // A unique index leaves the layout as it was; a reference doesn't.
+    assert_eq!(plain::Item::FINGERPRINT, indexed::Item::FINGERPRINT);
     assert_ne!(plain::Order::FINGERPRINT, indexed::Order::FINGERPRINT);
 
     drop(indexed::Db::open(&path).unwrap());
@@ -266,4 +261,22 @@ fn a_migration_can_remove_indexes() {
     let db = plain::Db::open(&path).unwrap();
     assert_eq!(db.items().len().unwrap(), 3);
     assert_eq!(db.orders().len().unwrap(), 3);
+}
+
+/// More orders than the reference check reads at once, with the dangling
+/// one last.
+#[test]
+fn the_reference_check_reads_every_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shop.redb");
+    let mut orders = vec![1; 600];
+    orders.push(7);
+    seed(&path, &["lamp"], &orders);
+
+    let err = indexed::Db::open(&path).err().unwrap();
+    assert!(
+        matches!(&err, Error::ForeignKey { entity: "Order", field: "item", id, .. } if id == "ItemId(7)"),
+        "{err}"
+    );
+    assert_eq!(plain::Db::open(&path).unwrap().orders().len().unwrap(), 601);
 }

@@ -7,7 +7,8 @@ use proc_macro2::TokenStream;
 use syn::parse::ParseStream;
 use syn::spanned::Spanned;
 use syn::{
-    Attribute, Fields, FnArg, GenericArgument, Ident, Item, ItemFn, ItemMod, ItemStruct, PathArguments, Token, Type,
+    Attribute, Expr, Fields, FnArg, GenericArgument, Ident, Item, ItemFn, ItemMod, ItemStruct, LitStr, PathArguments,
+    Token, Type,
 };
 
 use crate::print::{self, Errors, FieldKind, Print};
@@ -30,6 +31,8 @@ pub struct Entity {
     pub accessor: Ident,
     pub id: IdField,
     pub fields: Vec<Field>,
+    /// Field indexes in field order, then the struct's own `#[index(...)]`s.
+    pub indexes: Vec<Index>,
     /// Every field a row stores, the id too, in order, with its type, or
     /// `None` if it has a `#[fingerprint]` label.
     pub stored: Vec<(Ident, Option<Type>)>,
@@ -61,10 +64,34 @@ impl IdKind {
 pub struct Field {
     pub ident: Ident,
     pub shape: Shape,
-    /// `T` in `T`, `Option<T>` or `Vec<T>`.
-    pub inner: Type,
     pub references: Option<Reference>,
+}
+
+/// A `#[unique]` or `#[index]` field, or an `#[index(name: K = expr)]` on
+/// the struct.
+pub struct Index {
+    /// The field's name, or the one the struct's `#[index]` gives it.
+    pub name: Ident,
     pub unique: bool,
+    /// The key type: the field's `T` of `T`, `Option<T>` or `Vec<T>`, or the
+    /// declared `K`.
+    pub key: Type,
+    pub on: Indexed,
+    /// A const expression for the index's fingerprint. The entity's doesn't
+    /// cover indexes, so that adding or changing one needs no migration.
+    pub fingerprint: TokenStream,
+}
+
+pub enum Indexed {
+    Field {
+        ident: Ident,
+        shape: Shape,
+    },
+    Expr {
+        expr: Expr,
+        /// The attribute as written, for the catalog.
+        written: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -133,6 +160,16 @@ pub fn schema(module: &mut ItemMod) -> syn::Result<Schema> {
                     e.ident, other.ident, e.accessor
                 ),
             ));
+        }
+        for (i, index) in e.indexes.iter().enumerate() {
+            let taken = e.indexes[..i].iter().any(|o| o.name == index.name)
+                || e.fields.iter().any(|f| f.references.is_some() && f.ident == index.name);
+            if taken && matches!(index.on, Indexed::Expr { .. }) {
+                errors.push(syn::Error::new(
+                    index.name.span(),
+                    format!("`{}` already names an index or a reference of {}", index.name, e.ident),
+                ));
+            }
         }
         for f in &e.fields {
             let Some(r) = &f.references else { continue };
@@ -204,6 +241,7 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
     let mut errors = Errors::default();
     let mut id = None;
     let mut fields = Vec::new();
+    let mut indexes = Vec::new();
     let mut stored = Vec::new();
     let mut fingerprint = Print::new("entity");
     fingerprint.str(print::FORMAT);
@@ -216,11 +254,13 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
         let id_attr = take_attr(&mut f.attrs, "id");
         let ref_attr = take_attr(&mut f.attrs, "references");
         let unique_attr = take_attr(&mut f.attrs, "unique");
+        let index_attr = take_attr(&mut f.attrs, "index");
+        let indexed = unique_attr.is_some() || index_attr.is_some();
         match print::field(&mut fingerprint, f, &ident.to_string()) {
-            Ok(FieldKind::Skipped) if id_attr.is_some() || ref_attr.is_some() || unique_attr.is_some() => {
+            Ok(FieldKind::Skipped) if id_attr.is_some() || ref_attr.is_some() || indexed => {
                 errors.push(syn::Error::new(
                     ident.span(),
-                    "#[id], #[references] and #[unique] fields can't be `serde(skip)`",
+                    "#[id], #[references], #[unique] and #[index] fields can't be `serde(skip)`",
                 ));
             }
             Ok(FieldKind::Labelled) if id_attr.is_some() => {
@@ -236,10 +276,10 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
         }
 
         if let Some(attr) = id_attr {
-            if ref_attr.is_some() || unique_attr.is_some() {
+            if ref_attr.is_some() || indexed {
                 errors.push(syn::Error::new(
                     attr.span(),
-                    "the id field cannot also be #[references] or #[unique]",
+                    "the id field cannot also be #[references], #[unique] or #[index]",
                 ));
             }
             if id.is_some() {
@@ -282,21 +322,51 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
                 }
             },
         };
-        if let Some(attr) = &unique_attr {
+        for attr in unique_attr.iter().chain(&index_attr) {
             if !matches!(attr.meta, syn::Meta::Path(_)) {
-                errors.push(syn::Error::new(attr.span(), "#[unique] takes no arguments"));
+                let name = attr.path().get_ident().expect("unique or index");
+                errors.push(syn::Error::new(
+                    attr.span(),
+                    format!("#[{name}] on a field takes no arguments; an index of computed keys goes on the struct"),
+                ));
             }
-            if shape == Shape::Vec {
-                errors.push(syn::Error::new(attr.span(), "#[unique] is not supported on Vec fields"));
-            }
-            fingerprint.str("unique");
+        }
+        if let (Some(_), Some(attr)) = (&unique_attr, &index_attr) {
+            errors.push(syn::Error::new(attr.span(), "#[unique] already indexes the field"));
+        }
+        if let (Some(_), Some(attr)) = (&references, &index_attr) {
+            errors.push(syn::Error::new(
+                attr.span(),
+                "#[references] already indexes the field: its `by_` lookup finds the rows that reference a parent",
+            ));
+        }
+        if indexed {
+            let unique = unique_attr.is_some();
+            let mut print = Print::new("index");
+            print.str(if unique { "unique" } else { "index" });
+            print.str("field");
+            print.str(&ident.to_string());
+            print.str(match shape {
+                Shape::One => "one",
+                Shape::Option => "option",
+                Shape::Vec => "vec",
+            });
+            print.u64(print::type_print(&inner));
+            indexes.push(Index {
+                name: ident.clone(),
+                unique,
+                key: inner,
+                on: Indexed::Field {
+                    ident: ident.clone(),
+                    shape,
+                },
+                fingerprint: print.finish(),
+            });
         }
         fields.push(Field {
             ident,
             shape,
-            inner,
             references,
-            unique: unique_attr.is_some(),
         });
     }
 
@@ -310,6 +380,18 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
             None
         }
     };
+    while let Some(attr) = take_attr(&mut s.attrs, "index") {
+        match struct_index(&attr) {
+            Ok(index) => indexes.push(index),
+            Err(e) => errors.push(e),
+        }
+    }
+    if let Some(attr) = s.attrs.iter().find(|a| a.path().is_ident("unique")) {
+        errors.push(syn::Error::new(
+            attr.span(),
+            "a unique index of computed keys is #[index(name: KeyType = |row| ..., unique)]",
+        ));
+    }
     errors.finish()?;
 
     let accessor = accessor.unwrap_or_else(|| Ident::new(&plural(&snake_case(&s.ident.to_string())), s.ident.span()));
@@ -319,8 +401,82 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
         accessor,
         id: id.expect("checked above"),
         fields,
+        indexes,
         stored,
         fingerprint: fingerprint.finish(),
+    })
+}
+
+/// The attribute as written, or as tokens when its text isn't available.
+fn written(list: &syn::MetaList) -> String {
+    let span = match &list.delimiter {
+        syn::MacroDelimiter::Paren(p) => p.span.join(),
+        syn::MacroDelimiter::Brace(b) => b.span.join(),
+        syn::MacroDelimiter::Bracket(b) => b.span.join(),
+    };
+    match span.source_text() {
+        Some(args) => format!("#[index{args}]"),
+        None => format!("#[index({})]", list.tokens),
+    }
+}
+
+/// `#[index(name: K = expr)]` on an entity, optionally followed by `unique`
+/// and `fingerprint = "..."`.
+fn struct_index(attr: &Attribute) -> syn::Result<Index> {
+    let usage = "expected #[index(name: KeyType = |row| ...)], optionally followed by \
+                 `, unique` and `, fingerprint = \"...\"`";
+    let syn::Meta::List(list) = &attr.meta else {
+        return Err(syn::Error::new(attr.span(), usage));
+    };
+    list.parse_args_with(|input: ParseStream| {
+        let name: Ident = input.parse()?;
+        input.parse::<Token![:]>()?;
+        let key: Type = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let expr: Expr = input.parse()?;
+        let mut unique = false;
+        let mut label = None;
+        while input.parse::<Option<Token![,]>>()?.is_some() && !input.is_empty() {
+            let option: Ident = input.parse()?;
+            if option == "unique" {
+                unique = true;
+            } else if option == "fingerprint" {
+                input.parse::<Token![=]>()?;
+                label = Some(input.parse::<LitStr>()?.value());
+            } else {
+                return Err(syn::Error::new(
+                    option.span(),
+                    "expected `unique` or `fingerprint = \"...\"`, a label that you change whenever \
+                     something the expression calls changes the keys it returns",
+                ));
+            }
+        }
+        // The expression as written stands in for what it computes, which
+        // the macro can't see past: the label covers the functions it calls.
+        let mut print = Print::new("index");
+        print.str(if unique { "unique" } else { "index" });
+        print.str("expr");
+        print.str(&print::tokens(&expr));
+        print.u64(print::type_print(&key));
+        if let Some(label) = &label {
+            print.str("label");
+            print.str(label);
+        }
+        Ok(Index {
+            name,
+            unique,
+            key,
+            on: Indexed::Expr {
+                expr,
+                written: written(list),
+            },
+            fingerprint: print.finish(),
+        })
+    })
+    .map_err(|e| {
+        let mut all = syn::Error::new(e.span(), usage);
+        all.combine(e);
+        all
     })
 }
 

@@ -5,10 +5,11 @@
 //! live in a private `__orangedb` submodule.
 
 use proc_macro2::{Literal, TokenStream};
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, quote_spanned};
+use syn::spanned::Spanned;
 use syn::{Ident, LitStr};
 
-use crate::parse::{Entity, Field, IdKind, OnDelete, Schema, Shape, snake_case};
+use crate::parse::{Entity, Field, IdKind, Index, Indexed, OnDelete, Schema, Shape, snake_case};
 
 pub fn expand(schema: &Schema, source: &str) -> TokenStream {
     let source = LitStr::new(source, proc_macro2::Span::call_site());
@@ -24,17 +25,35 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
     let detaches: Vec<Ident> = entities.iter().map(|e| fn_name("detach", e)).collect();
     let erases: Vec<Ident> = entities.iter().map(|e| fn_name("erase", e)).collect();
     let creates = entities.iter().map(|e| {
+        let ident = &e.ident;
         let rows = rows_const(e);
-        let fks = e
+        let fks: Vec<Ident> = e
             .fields
             .iter()
             .filter(|f| f.references.is_some())
-            .map(|f| fk_const(e, f));
-        let uniques = e.fields.iter().filter(|f| f.unique).map(|f| unique_const(e, f));
+            .map(|f| fk_const(e, f))
+            .collect();
+        let indexes: Vec<Ident> = e.indexes.iter().map(|i| index_const(e, i)).collect();
+        let create_index = e.indexes.iter().map(|i| {
+            let name = index_const(e, i);
+            if i.unique {
+                quote!(rt::create_table(tx, #name)?;)
+            } else {
+                quote!(rt::create_multimap_table(tx, #name)?;)
+            }
+        });
+        let rebuild = fn_name("rebuild", e);
         quote! {
             rt::create_row_table(tx, #rows)?;
             #( rt::create_multimap_table(tx, #fks)?; )*
-            #( rt::create_table(tx, #uniques)?; )*
+            #( #create_index )*
+            rt::drop_other_tables(
+                tx,
+                stringify!(#ident),
+                <#ident as ::orangedb::Entity>::FINGERPRINT,
+                &[ #( #fks.name(), )* #( #indexes.name(), )* ],
+            )?;
+            #rebuild(tx, &existing)?;
         }
     });
 
@@ -46,9 +65,7 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
             let rows = rows_const(e);
             let check = fn_name("check", e);
             quote! {
-                for bytes in rt::Store::rows(tx, #rows)? {
-                    #check(tx, &rt::decode::<#ident>(&bytes)?, true)?;
-                }
+                rt::for_each_row(tx, #rows, |bytes| #check(tx, &rt::decode::<#ident>(bytes)?, true))?;
             }
         });
     let layouts = entities.iter().map(layout);
@@ -134,7 +151,7 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
             }
 
             /// What the database records about its layouts: the tables,
-            /// references, unique fields and source of every entity at every
+            /// references, indexes and source of every entity at every
             /// fingerprint it has stored, current or migrated away from.
             pub fn stored_catalog(&self) -> ::orangedb::Result<::orangedb::catalog::Catalog> {
                 use ::orangedb::redb::ReadableDatabase as _;
@@ -249,7 +266,9 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
             use super::*;
             use ::orangedb::__private as rt;
             use ::orangedb::__private::Store as _;
-            use ::orangedb::redb::{MultimapTableDefinition, TableDefinition, WriteTransaction};
+            use ::orangedb::redb::{
+                MultimapTableDefinition, MultimapTableHandle as _, TableDefinition, TableHandle as _, WriteTransaction,
+            };
             use ::orangedb::{Error, Result};
 
             #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -274,6 +293,9 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
             }
 
             pub fn create_tables(tx: &WriteTransaction) -> Result<()> {
+                // Before creating any: the index tables missing from it
+                // are filled from the rows.
+                let existing = rt::table_names(tx)?;
                 #( #creates )*
                 Ok(())
             }
@@ -560,56 +582,120 @@ fn methods(schema: &Schema, e: &Entity) -> Vec<Method> {
         ),
     ];
 
+    // A listed id with no row means a corrupt index: report it.
+    let fetch = |ids: TokenStream| {
+        quote! {
+            #ids
+                .into_iter()
+                .map(|id| {
+                    self.get(&id)?.ok_or_else(|| ::orangedb::Error::NotFound {
+                        entity: <#ident as ::orangedb::Entity>::NAME,
+                        id: ::orangedb::__private::fmt_id(&id),
+                    })
+                })
+                .collect()
+        }
+    };
+
     for f in &e.fields {
         let field = &f.ident;
-        if f.unique {
-            let inner = &f.inner;
-            let uq = unique_const(e, f);
+        let Some(r) = &f.references else { continue };
+        // A unique reference is looked up through its unique index.
+        if e.indexes.iter().any(|i| i.name == *field) {
+            continue;
+        }
+        let target_id = &schema.entity(&r.target).id.ty;
+        let fk = fk_const(e, f);
+        let ids_by = format_ident!("ids_by_{}", field);
+        out.push(m(
+            false,
+            &format!("Ids of the rows whose `{field}` references `parent`."),
+            &format!("ids_by_{field}"),
+            vec![("parent", quote!(impl ::std::borrow::Borrow<#target_id>))],
+            quote!(::std::vec::Vec<#id_ty>),
+            quote! {
+                ::orangedb::__private::Store::get_all(self.tx, __orangedb::#fk, parent.borrow())
+            },
+        ));
+        out.push(m(
+            false,
+            &format!("The rows whose `{field}` references `parent`, in id order."),
+            &format!("by_{field}"),
+            vec![("parent", quote!(impl ::std::borrow::Borrow<#target_id>))],
+            quote!(::std::vec::Vec<#ident>),
+            fetch(quote!(self.#ids_by(parent)?)),
+        ));
+    }
+
+    for index in &e.indexes {
+        let name = &index.name;
+        let key = &index.key;
+        let table = index_const(e, index);
+        let what = match &index.on {
+            Indexed::Field { .. } => format!("`{name}`"),
+            Indexed::Expr { .. } => format!("the `{name}` index's key"),
+        };
+        let range_arg = vec![("range", quote!(impl ::std::ops::RangeBounds<#key>))];
+        if index.unique {
             out.push(m(
                 false,
-                &format!("The row whose unique `{field}` equals `value`, if any."),
-                &format!("by_{field}"),
-                vec![("value", quote!(impl ::std::convert::Into<#inner>))],
+                &format!("The row whose unique {what} equals `value`, if any."),
+                &format!("by_{name}"),
+                vec![("value", quote!(impl ::std::convert::Into<#key>))],
                 quote!(::std::option::Option<#ident>),
                 quote! {
-                    match ::orangedb::__private::Store::get(self.tx, __orangedb::#uq, &value.into())? {
+                    match ::orangedb::__private::Store::get(self.tx, __orangedb::#table, &value.into())? {
                         Some(id) => self.get(id),
                         None => Ok(None),
                     }
                 },
             ));
-        } else if let Some(r) = &f.references {
-            let target_id = &schema.entity(&r.target).id.ty;
-            let fk = fk_const(e, f);
-            let ids_by = format_ident!("ids_by_{}", field);
             out.push(m(
                 false,
-                &format!("Ids of the rows whose `{field}` references `parent`."),
-                &format!("ids_by_{field}"),
-                vec![("parent", quote!(impl ::std::borrow::Borrow<#target_id>))],
+                &format!("The rows whose unique {what} falls in `range`, in key order."),
+                &format!("range_by_{name}"),
+                range_arg,
+                quote!(::std::vec::Vec<#ident>),
+                fetch(quote! {
+                    ::orangedb::__private::first_seen(
+                        ::orangedb::__private::Store::range(self.tx, __orangedb::#table, range)?,
+                    )
+                }),
+            ));
+        } else {
+            let ids_by = format_ident!("ids_by_{}", name);
+            out.push(m(
+                false,
+                &format!("Ids of the rows whose {what} equals `value`, in id order."),
+                &format!("ids_by_{name}"),
+                vec![("value", quote!(impl ::std::convert::Into<#key>))],
                 quote!(::std::vec::Vec<#id_ty>),
                 quote! {
-                    ::orangedb::__private::Store::get_all(self.tx, __orangedb::#fk, parent.borrow())
+                    ::orangedb::__private::Store::get_all(self.tx, __orangedb::#table, &value.into())
                 },
             ));
             out.push(m(
                 false,
-                &format!("The rows whose `{field}` references `parent`, in id order."),
-                &format!("by_{field}"),
-                vec![("parent", quote!(impl ::std::borrow::Borrow<#target_id>))],
+                &format!("The rows whose {what} equals `value`, in id order."),
+                &format!("by_{name}"),
+                vec![("value", quote!(impl ::std::convert::Into<#key>))],
                 quote!(::std::vec::Vec<#ident>),
-                // A listed id with no row means a corrupt index: report it.
-                quote! {
-                    self.#ids_by(parent)?
-                        .into_iter()
-                        .map(|id| {
-                            self.get(&id)?.ok_or_else(|| ::orangedb::Error::NotFound {
-                                entity: <#ident as ::orangedb::Entity>::NAME,
-                                id: ::orangedb::__private::fmt_id(&id),
-                            })
-                        })
-                        .collect()
-                },
+                fetch(quote!(self.#ids_by(value)?)),
+            ));
+            out.push(m(
+                false,
+                &format!(
+                    "The rows whose {what} falls in `range`, in key order and then id order. \
+                     A row with several keys in it is listed once, at the first."
+                ),
+                &format!("range_by_{name}"),
+                range_arg,
+                quote!(::std::vec::Vec<#ident>),
+                fetch(quote! {
+                    ::orangedb::__private::first_seen(
+                        ::orangedb::__private::Store::range_all(self.tx, __orangedb::#table, range)?,
+                    )
+                }),
             ));
         }
     }
@@ -724,9 +810,9 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
     let erase = fn_name("erase", e);
     let detach = fn_name("detach", e);
     let plan = fn_name("plan", e);
+    let rebuild = fn_name("rebuild", e);
 
     let fks: Vec<&Field> = e.fields.iter().filter(|f| f.references.is_some()).collect();
-    let uniques: Vec<&Field> = e.fields.iter().filter(|f| f.unique).collect();
 
     let consts = fks
         .iter()
@@ -739,27 +825,46 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
                 &format!(".{}.fk", f.ident),
             )
         })
-        .chain(uniques.iter().map(|f| {
-            let inner = &f.inner;
-            table_const(
-                e,
-                &unique_const(e, f),
-                quote!(TableDefinition<'static, #inner, #id_ty>),
-                &format!(".{}.unique", f.ident),
-            )
-        }));
+        .chain(e.indexes.iter().map(|i| index_items(e, i)));
     let rows_table = table_const(e, &rows, quote!(rt::RowTable<#id_ty>), "");
 
     let fk_names: Vec<Ident> = fks.iter().map(|f| fk_const(e, f)).collect();
-    let uq_names: Vec<Ident> = uniques.iter().map(|f| unique_const(e, f)).collect();
     let fk_old: Vec<TokenStream> = fks.iter().map(|f| values(quote!(old), f)).collect();
     let fk_new: Vec<TokenStream> = fks.iter().map(|f| values(quote!(row), f)).collect();
-    let uq_old: Vec<TokenStream> = uniques.iter().map(|f| values(quote!(old), f)).collect();
-    let uq_new: Vec<TokenStream> = uniques.iter().map(|f| values(quote!(row), f)).collect();
+    let index_new: Vec<TokenStream> = e.indexes.iter().map(|i| link_index(e, i)).collect();
+    // A non-unique index holds (key, id) pairs, so this removes the old
+    // row's pairs and leaves other rows with the same keys alone. It
+    // recomputes the old keys, which is why an index's fingerprint has to
+    // change with them.
+    let index_old = e.indexes.iter().map(|i| {
+        let name = index_const(e, i);
+        let keys = index_values(e, quote!(old), i);
+        if i.unique {
+            quote!(for value in #keys { rt::remove(tx, #name, value)?; })
+        } else {
+            quote!(for value in #keys { rt::unlink(tx, #name, value, &old.#id_field)?; })
+        }
+    });
+    let index_names: Vec<Ident> = e.indexes.iter().map(|i| index_const(e, i)).collect();
     let unlink_old = quote! {
         #( for parent in #fk_old { rt::unlink(tx, #fk_names, parent, &old.#id_field)?; } )*
-        #( for value in #uq_old { rt::remove(tx, #uq_names, value)?; } )*
+        #( #index_old )*
     };
+    let index_checks: Vec<TokenStream> = e.indexes.iter().map(|i| check_index(e, i)).collect();
+    let rebuilds = e
+        .indexes
+        .iter()
+        .zip(&index_checks)
+        .zip(&index_new)
+        .map(|((i, check), link)| {
+            let name = index_const(e, i);
+            quote! {
+                if !existing.contains(#name.name()) {
+                    #check
+                    #link
+                }
+            }
+        });
 
     let fk_checks = fks.iter().map(|f| {
         let target = &f.references.as_ref().unwrap().target;
@@ -775,25 +880,6 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
                         target: stringify!(#target),
                         id: rt::fmt_id(parent),
                     });
-                }
-            }
-        }
-    });
-    let uq_checks = uniques.iter().map(|f| {
-        let name = unique_const(e, f);
-        let field = LitStr::new(&f.ident.to_string(), f.ident.span());
-        let iter = values(quote!(row), f);
-        quote! {
-            for value in #iter {
-                if let Some(owner) = rt::Store::get(tx, #name, value)? {
-                    if owner != row.#id_field {
-                        return Err(Error::Unique {
-                            entity: stringify!(#ident),
-                            field: #field,
-                            value: rt::fmt_id(value),
-                            owner: rt::fmt_id(&owner),
-                        });
-                    }
                 }
             }
         }
@@ -874,7 +960,7 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
             if fks {
                 #( #fk_checks )*
             }
-            #( #uq_checks )*
+            #( #index_checks )*
             Ok(())
         }
 
@@ -887,7 +973,7 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
             }
             rt::put_row(tx, #rows, &row.#id_field, &bytes)?;
             #( for parent in #fk_new { rt::link(tx, #fk_names, parent, &row.#id_field)?; } )*
-            #( for value in #uq_new { rt::put(tx, #uq_names, value, &row.#id_field)?; } )*
+            #( #index_new )*
             Ok(())
         }
 
@@ -905,6 +991,20 @@ fn internal_items(schema: &Schema, e: &Entity) -> TokenStream {
         /// Clears the `set_null` reference `field` that points at `parent`.
         pub fn #detach(tx: &WriteTransaction, id: &#id_ty, field: &'static str, parent: &AnyId) -> Result<()> {
             #detach_body
+        }
+
+        /// Fills the index tables missing from `existing`, the tables there
+        /// were before `create_tables`, from the stored rows.
+        pub fn #rebuild(tx: &WriteTransaction, existing: &::std::collections::BTreeSet<::std::string::String>) -> Result<()> {
+            let fresh = [ #( !existing.contains(#index_names.name()) ),* ];
+            if !fresh.contains(&true) {
+                return Ok(());
+            }
+            rt::for_each_row(tx, #rows, |bytes| {
+                let row: #ident = rt::decode(bytes)?;
+                #( #rebuilds )*
+                Ok(())
+            })
         }
 
         /// Adds the effects of deleting `id` on the rows that reference it.
@@ -961,17 +1061,31 @@ fn layout(e: &Entity) -> TokenStream {
             }
         })
     });
-    let uniques = e.fields.iter().filter(|f| f.unique).map(|f| {
-        let field = LitStr::new(&f.ident.to_string(), f.ident.span());
-        let shape = shape(f.shape);
-        let ty = type_text(&f.inner);
-        let uq = unique_const(e, f);
+    let indexes = e.indexes.iter().map(|i| {
+        let name = LitStr::new(&i.name.to_string(), i.name.span());
+        let unique = i.unique;
+        let on = match &i.on {
+            Indexed::Field { ident, shape: s } => {
+                let field = LitStr::new(&ident.to_string(), ident.span());
+                let s = shape(*s);
+                quote!(c::Indexed::Field { field: #field.into(), shape: #s })
+            }
+            Indexed::Expr { written, .. } => {
+                let written = LitStr::new(written, proc_macro2::Span::call_site());
+                quote!(c::Indexed::Expr(#written.into()))
+            }
+        };
+        let ty = type_text(&i.key);
+        let table = index_const(e, i);
+        let fp = format_ident!("{}_FP", table);
         quote! {
-            c::Unique {
-                field: #field.into(),
-                shape: #shape,
+            c::Index {
+                name: #name.into(),
+                unique: #unique,
+                on: #on,
                 ty: #ty.into(),
-                index: __orangedb::#uq.name().into(),
+                fingerprint: __orangedb::#fp,
+                table: __orangedb::#table.name().into(),
             }
         }
     });
@@ -983,7 +1097,7 @@ fn layout(e: &Entity) -> TokenStream {
             fields: ::std::vec![ #( #fields ),* ],
             rows: __orangedb::#rows.name().into(),
             references: ::std::vec![ #( #references ),* ],
-            uniques: ::std::vec![ #( #uniques ),* ],
+            indexes: ::std::vec![ #( #indexes ),* ],
             source,
         }
     }
@@ -1044,8 +1158,115 @@ fn fk_const(e: &Entity, f: &Field) -> Ident {
     format_ident!("{}_{}_FK", upper(e), f.ident.to_string().to_uppercase())
 }
 
-fn unique_const(e: &Entity, f: &Field) -> Ident {
-    format_ident!("{}_{}_UNIQUE", upper(e), f.ident.to_string().to_uppercase())
+fn index_const(e: &Entity, i: &Index) -> Ident {
+    format_ident!("{}_{}_INDEX", upper(e), i.name.to_string().to_uppercase())
+}
+
+/// The index's table and fingerprint, and for an expression, the function
+/// that computes a row's keys.
+fn index_items(e: &Entity, i: &Index) -> TokenStream {
+    let ident = &e.ident;
+    let id_ty = &e.id.ty;
+    let key = &i.key;
+    let name = index_const(e, i);
+    let fp = format_ident!("{}_FP", name);
+    let bytes = format_ident!("{}_NAME", name);
+    let fingerprint = &i.fingerprint;
+    let index = i.name.to_string();
+    let suffix = if i.unique { ".unique" } else { ".index" };
+    let len = Literal::usize_unsuffixed(ident.to_string().len() + 1 + 16 + 1 + index.len() + 1 + 16 + suffix.len());
+    let def = if i.unique {
+        quote!(TableDefinition<'static, #key, #id_ty>)
+    } else {
+        quote!(MultimapTableDefinition<'static, #key, #id_ty>)
+    };
+    let keys = match &i.on {
+        Indexed::Field { .. } => quote!(),
+        Indexed::Expr { expr, .. } => {
+            let keys = keys_fn(e, i);
+            // An expression that returns the wrong type is reported at it.
+            // Only the path takes its span: `row` must keep the macro's.
+            let index_keys = quote_spanned!(expr.span()=> rt::index_keys::<#ident, #key, _>);
+            let call = quote!(#index_keys(#expr, row));
+            quote! {
+                /// The keys of the index for `row`.
+                pub fn #keys(row: &#ident) -> ::std::vec::Vec<#key> {
+                    #call
+                }
+            }
+        }
+    };
+    // Points the error for a type that can't be a key at the type.
+    let key_check = quote_spanned!(key.span()=> const _: fn() = rt::index_key::<#key>;);
+    quote! {
+        #key_check
+        pub const #fp: u64 = #fingerprint;
+        const #bytes: [u8; #len] = rt::index_table_name(
+            stringify!(#ident),
+            <#ident as ::orangedb::Entity>::FINGERPRINT,
+            #index,
+            #fp,
+            #suffix,
+        );
+        pub const #name: #def = <#def>::new(rt::utf8(&#bytes));
+        #keys
+    }
+}
+
+fn keys_fn(e: &Entity, i: &Index) -> Ident {
+    format_ident!("keys_{}_{}", snake_case(&e.ident.to_string()), i.name)
+}
+
+/// An iterator over references to the keys `i` gives `row`.
+fn index_values(e: &Entity, row: TokenStream, i: &Index) -> TokenStream {
+    match &i.on {
+        Indexed::Field { ident, shape } => match shape {
+            Shape::One => quote!(::std::iter::once(&#row.#ident)),
+            Shape::Option | Shape::Vec => quote!(#row.#ident.iter()),
+        },
+        Indexed::Expr { .. } => {
+            let keys = keys_fn(e, i);
+            quote!(#keys(&#row).iter())
+        }
+    }
+}
+
+/// Adds `row`'s keys to `i`.
+fn link_index(e: &Entity, i: &Index) -> TokenStream {
+    let id_field = &e.id.ident;
+    let name = index_const(e, i);
+    let keys = index_values(e, quote!(row), i);
+    if i.unique {
+        quote!(for value in #keys { rt::put(tx, #name, value, &row.#id_field)?; })
+    } else {
+        quote!(for value in #keys { rt::link(tx, #name, value, &row.#id_field)?; })
+    }
+}
+
+/// Rejects `row` if `i` is unique and another row holds one of its keys.
+fn check_index(e: &Entity, i: &Index) -> TokenStream {
+    if !i.unique {
+        return quote!();
+    }
+    let ident = &e.ident;
+    let id_field = &e.id.ident;
+    let name = index_const(e, i);
+    let field = LitStr::new(&i.name.to_string(), i.name.span());
+    let keys = index_values(e, quote!(row), i);
+    quote! {
+        for value in #keys {
+            if let Some(owner) = rt::Store::get(tx, #name, value)? {
+                if owner != row.#id_field {
+                    return Err(Error::Unique {
+                        entity: stringify!(#ident),
+                        field: #field,
+                        value: rt::fmt_id(value),
+                        owner: rt::fmt_id(&owner),
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn fn_name(prefix: &str, e: &Entity) -> Ident {

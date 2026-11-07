@@ -120,7 +120,7 @@ fn schema_source_of_a_macro_generated_module_is_expanded() {
 #[test]
 fn the_catalog_describes_every_table() {
     use orangedb::Entity;
-    use orangedb::catalog::{IdKind, OnDelete, Shape};
+    use orangedb::catalog::{IdKind, Indexed, OnDelete, Shape};
     use orangedb::redb::{MultimapTableHandle, TableHandle};
 
     let dir = tempfile::tempdir().unwrap();
@@ -150,10 +150,22 @@ fn the_catalog_describes_every_table() {
         ]
     );
     assert!(user.references.is_empty());
-    assert_eq!(user.uniques.len(), 1);
-    assert_eq!(user.uniques[0].field, "email");
-    assert_eq!(user.uniques[0].ty, "String");
-    assert_eq!(user.uniques[0].index, format!("{}.email.unique", user.rows));
+    assert_eq!(user.indexes.len(), 1);
+    let email = &user.indexes[0];
+    assert_eq!(email.name, "email");
+    assert!(email.unique);
+    assert_eq!(
+        email.on,
+        Indexed::Field {
+            field: "email".into(),
+            shape: Shape::One
+        }
+    );
+    assert_eq!(email.ty, "String");
+    assert_eq!(
+        email.table,
+        format!("{}.email@{:016x}.unique", user.rows, email.fingerprint)
+    );
 
     let post = catalog.layout("Post", Post::FINGERPRINT).unwrap();
     assert_eq!(post.id.kind, IdKind::Auto);
@@ -179,8 +191,9 @@ fn the_catalog_describes_every_table() {
         for r in &layout.references {
             assert!(multimaps.contains(&r.index), "{}", r.index);
         }
-        for u in &layout.uniques {
-            assert!(tables.contains(&u.index), "{}", u.index);
+        for i in &layout.indexes {
+            let kind = if i.unique { &tables } else { &multimaps };
+            assert!(kind.contains(&i.table), "{}", i.table);
         }
         // The module's source is stored once, for all of its entities.
         assert!(catalog.source(layout).unwrap().contains("pub mod schema"));
@@ -443,17 +456,6 @@ mod shop {
                 pub name: String,
             }
         }
-        /// `name` becomes unique, which would need an index the file doesn't have.
-        made_unique {
-            #[entity]
-            pub struct Item {
-                #[id(auto)]
-                pub id: ItemId,
-                #[unique]
-                pub name: String,
-                pub price: u32,
-            }
-        }
         /// The id switches from auto to a natural key.
         key_id {
             #[entity]
@@ -567,7 +569,6 @@ fn schema_changes_that_break_the_layout_are_rejected() {
         ("price_type", shop::price_type::Db::open(&path).err()),
         ("renamed", shop::renamed::Db::open(&path).err()),
         ("reordered", shop::reordered::Db::open(&path).err()),
-        ("made_unique", shop::made_unique::Db::open(&path).err()),
         ("key_id", shop::key_id::Db::open(&path).err()),
     ];
     let stored = <shop::v1::Item as orangedb::Entity>::FINGERPRINT;

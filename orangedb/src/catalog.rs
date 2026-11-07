@@ -3,9 +3,10 @@
 //!
 //! Opening a database records a [`Layout`] for every entity next to its
 //! fingerprint: the tables its rows and indexes live in, its references and
-//! unique fields, and the source of the schema module that declared it.
+//! indexes, and the source of the schema module that declared it.
 //! Layouts of earlier fingerprints stay after a migration, so the catalog is
-//! also the database's schema history.
+//! also the database's schema history. Indexes aren't part of a fingerprint,
+//! so a layout lists the indexes of the schema that opened it last.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -39,7 +40,7 @@ pub struct Layout {
     /// The table of rows: id to postcard bytes.
     pub rows: String,
     pub references: Vec<Reference>,
-    pub uniques: Vec<Unique>,
+    pub indexes: Vec<Index>,
     /// The key of the schema module's source in [`Catalog::sources`].
     pub source: u64,
 }
@@ -81,15 +82,33 @@ pub struct Reference {
     pub index: String,
 }
 
-/// A `#[unique]` field.
+/// A `#[unique]` or `#[index]` field, or an `#[index(...)]` on the entity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Unique {
-    pub field: String,
-    pub shape: Shape,
-    /// The value type as written: `T` of `T` or `Option<T>`.
+pub struct Index {
+    /// The name its lookups go by, `by_{name}`.
+    pub name: String,
+    pub unique: bool,
+    pub on: Indexed,
+    /// The key type as written.
     pub ty: String,
-    /// The table from a value to the id that holds it.
-    pub index: String,
+    /// Changes whenever what the index holds does, see [`Index::table`].
+    pub fingerprint: u64,
+    /// For a unique index, the table from a key to the id that holds it;
+    /// otherwise the multimap table from a key to the ids that hold it. Its
+    /// name ends in the index's fingerprint, so a changed index gets a new
+    /// table.
+    pub table: String,
+}
+
+/// What an index's keys come from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Indexed {
+    /// The values of a field: `T`, the `Some` of an `Option<T>` or each
+    /// element of a `Vec<T>`.
+    Field { field: String, shape: Shape },
+    /// The keys an expression returns for each row, with the expression as
+    /// written.
+    Expr(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
