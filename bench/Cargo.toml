@@ -1,0 +1,23 @@
+[package]
+name = "orangedb-bench"
+description = "Benchmarks orangedb against minisqlite and turso on a small relational schema"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Kept out of the main workspace so turso's dependency tree stays out of its lockfile.
+[workspace]
+
+[dependencies]
+orangedb = { path = "../orangedb" }
+minisqlite = { git = "https://github.com/cursor/minisqlite" }
+turso = "0.8"
+tokio = { version = "1", features = ["rt"] }
+tempfile = "3"
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "relational"
+harness = false

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["orangedb", "orangedb-cli", "orangedb-macros"]
+exclude = ["bench"]
 
 [workspace.package]
 version = "0.2.0"
