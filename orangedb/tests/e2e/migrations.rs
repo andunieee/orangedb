@@ -4,7 +4,7 @@
 //! - v1: users, posts, threaded comments and drafts.
 //! - v2: user names become structured, comments switch to string ids, drafts
 //!   are dropped. Posts don't change.
-//! - v3: posts get a unique slug.
+//! - v3: posts get a unique slug, migrated one post at a time.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -144,17 +144,15 @@ pub mod forum {
     pub mod v3 {
         use super::v2;
 
+        /// Only `Post` changed, so it is all there is to migrate.
         #[migrate]
-        fn from_v2(old: &v2::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
-            for post in old.posts().all()? {
-                new.posts().insert(&Post {
-                    id: PostId(post.id.0),
-                    author: UserId(post.author.0),
-                    slug: format!("{}-{}", post.id.0, post.title.to_lowercase().replace(' ', "-")),
-                    title: post.title,
-                })?;
-            }
-            Ok(())
+        fn post_from_v2(old: v2::Post) -> orangedb::Result<Post> {
+            Ok(Post {
+                id: PostId(old.id.0),
+                author: UserId(old.author.0),
+                slug: format!("{}-{}", old.id.0, old.title.to_lowercase().replace(' ', "-")),
+                title: old.title,
+            })
         }
 
         #[embed]
@@ -395,6 +393,188 @@ fn migrations_chain_and_run_once() {
     // Nor does a fresh database.
     v2::Db::open(dir.path().join("fresh.redb")).unwrap();
     assert_eq!(v2::RUNS.get(), 1);
+}
+
+/// Migrations from `v1` that migrate entities one row at a time.
+mod per_entity {
+    use super::v1;
+
+    pub mod mixed {
+        use super::v1;
+
+        /// `User` migrates on its own. Drafts are dropped, which takes the
+        /// global function, and it sees the migrated users.
+        #[orangedb::schema]
+        pub mod schema {
+            use super::v1;
+
+            #[migrate]
+            fn user_from_v1(old: v1::User) -> orangedb::Result<User> {
+                Ok(User {
+                    id: UserId(old.id.0),
+                    email: old.email,
+                    nick: old.name.to_lowercase(),
+                })
+            }
+
+            #[migrate]
+            fn from_v1(old: &v1::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
+                for user in new.users().all()? {
+                    assert_eq!(user.nick, user.nick.to_lowercase(), "users are migrated first");
+                }
+                for draft in old.drafts().all()? {
+                    new.notes().create(|id| Note { id, body: draft.body })?;
+                }
+                Ok(())
+            }
+
+            #[entity]
+            pub struct User {
+                #[id(auto)]
+                pub id: UserId,
+                #[unique]
+                pub email: String,
+                pub nick: String,
+            }
+
+            #[entity]
+            pub struct Post {
+                #[id(auto)]
+                pub id: PostId,
+                #[references(User, on_delete = cascade)]
+                pub author: UserId,
+                pub title: String,
+            }
+
+            #[entity]
+            pub struct Comment {
+                #[id(auto)]
+                pub id: CommentId,
+                #[references(Post, on_delete = cascade)]
+                pub post: PostId,
+                #[references(Comment, on_delete = cascade)]
+                pub parent: Option<CommentId>,
+                pub body: String,
+            }
+
+            /// New, and filled by the global function.
+            #[entity]
+            pub struct Note {
+                #[id(auto)]
+                pub id: NoteId,
+                pub body: String,
+            }
+        }
+    }
+
+    pub mod added {
+        use super::v1;
+
+        /// `User` migrates on its own and a new entity appears, which needs
+        /// no global function.
+        #[orangedb::schema]
+        pub mod schema {
+            use super::v1;
+
+            #[migrate]
+            fn user_from_v1(old: v1::User) -> orangedb::Result<User> {
+                if old.name == "Plato" {
+                    return Err(orangedb::Error::migration("no philosophers"));
+                }
+                Ok(User {
+                    id: UserId(old.id.0),
+                    email: old.email,
+                    nick: old.name,
+                })
+            }
+
+            #[entity]
+            pub struct User {
+                #[id(auto)]
+                pub id: UserId,
+                #[unique]
+                pub email: String,
+                pub nick: String,
+            }
+
+            #[entity]
+            pub struct Post {
+                #[id(auto)]
+                pub id: PostId,
+                #[references(User, on_delete = cascade)]
+                pub author: UserId,
+                pub title: String,
+            }
+
+            #[entity]
+            pub struct Comment {
+                #[id(auto)]
+                pub id: CommentId,
+                #[references(Post, on_delete = cascade)]
+                pub post: PostId,
+                #[references(Comment, on_delete = cascade)]
+                pub parent: Option<CommentId>,
+                pub body: String,
+            }
+
+            #[entity]
+            pub struct Draft {
+                #[id(auto)]
+                pub id: DraftId,
+                pub body: String,
+            }
+
+            #[entity]
+            pub struct Tag {
+                #[id(String)]
+                pub name: TagName,
+            }
+        }
+    }
+}
+
+#[test]
+fn per_entity_migrations_run_before_the_global_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("forum.redb");
+    seed(&path);
+
+    let db = per_entity::mixed::schema::Db::open(&path).unwrap();
+    let mut nicks: Vec<String> = db.users().all().unwrap().into_iter().map(|u| u.nick).collect();
+    nicks.sort();
+    assert_eq!(nicks, ["ada lovelace", "plato"]);
+    assert_eq!(db.notes().len().unwrap(), 1);
+    assert_eq!(db.comments().len().unwrap(), 2);
+    drop(db);
+    assert!(!table_names(&path).iter().any(|t| t.starts_with("Draft@")));
+}
+
+#[test]
+fn a_failed_per_entity_migration_leaves_the_database_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("forum.redb");
+    seed(&path);
+    let before = table_names(&path);
+
+    let err = per_entity::added::schema::Db::open(&path).err().unwrap();
+    assert_eq!(err.to_string(), "migration failed: no philosophers");
+    assert_eq!(table_names(&path), before);
+
+    // Without Plato it goes through, and the new entity starts out empty.
+    let db = v1::Db::open(&path).unwrap();
+    let plato = db
+        .users()
+        .all()
+        .unwrap()
+        .into_iter()
+        .find(|u| u.name == "Plato")
+        .unwrap();
+    db.users().delete(plato.id).unwrap();
+    drop(db);
+    let db = per_entity::added::schema::Db::open(&path).unwrap();
+    assert_eq!(db.users().all().unwrap()[0].nick, "Ada Lovelace");
+    assert_eq!(db.drafts().len().unwrap(), 1);
+    assert!(db.tags().is_empty().unwrap());
 }
 
 /// `v2` with a broken migration.

@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use proc_macro2::TokenStream;
+use quote::ToTokens;
 use syn::parse::ParseStream;
 use syn::spanned::Spanned;
 use syn::{
@@ -18,11 +19,30 @@ pub struct Schema {
     pub migration: Option<Migration>,
 }
 
-/// A `#[migrate]` function: `fn(old: &old_schema::ReadTx, new: &WriteTx)`.
+/// The `#[migrate]` functions, which migrate from the schema before this one.
 pub struct Migration {
-    pub function: Ident,
     /// The old schema's `ReadTx`.
     pub old: Type,
+    /// `fn(old: &old_schema::ReadTx, new: &WriteTx)`, which runs after the
+    /// per-entity ones.
+    pub global: Option<Ident>,
+    pub entities: Vec<EntityMigration>,
+}
+
+/// A `#[migrate]` function for one entity that changed:
+/// `fn(old: old_schema::Entity) -> orangedb::Result<Entity>`.
+pub struct EntityMigration {
+    pub function: Ident,
+    /// The entity in this schema, named like the old one.
+    pub entity: Ident,
+    /// The old entity's type.
+    pub old: syn::Path,
+}
+
+/// A `#[migrate]` function, before they are put together.
+enum MigrateFn {
+    Global { function: Ident, old: Type },
+    Entity { migration: EntityMigration, old: Type },
 }
 
 pub struct Entity {
@@ -128,7 +148,7 @@ pub fn schema(module: &mut ItemMod) -> syn::Result<Schema> {
     };
 
     let mut entities = Vec::new();
-    let mut migration: Option<Migration> = None;
+    let mut migrate_fns = Vec::new();
     let mut errors = Errors::default();
     for item in items.iter_mut() {
         if let Item::Struct(s) = item
@@ -143,12 +163,7 @@ pub fn schema(module: &mut ItemMod) -> syn::Result<Schema> {
             && let Some(attr) = take_attr(&mut f.attrs, "migrate")
         {
             match migrate(attr, f) {
-                Ok(_) if migration.is_some() => errors.push(syn::Error::new(
-                    f.sig.ident.span(),
-                    "a schema has one #[migrate] function, from the schema before it; \
-                     older schemas migrate with their own",
-                )),
-                Ok(m) => migration = Some(m),
+                Ok(m) => migrate_fns.push(m),
                 Err(e) => errors.push(e),
             }
         }
@@ -192,29 +207,168 @@ pub fn schema(module: &mut ItemMod) -> syn::Result<Schema> {
         ));
     }
 
+    let migration = migration(&entities, migrate_fns, &mut errors);
+
     errors.finish()?;
     Ok(Schema { entities, migration })
 }
 
-fn migrate(attr: Attribute, f: &ItemFn) -> syn::Result<Migration> {
-    let usage = "expected `fn name(old: &old_schema::ReadTx, new: &WriteTx) -> orangedb::Result<()>`";
+/// Puts the `#[migrate]` functions together: at most one global one, at
+/// most one per entity of this schema, and all from the same old schema.
+fn migration(entities: &[Entity], fns: Vec<MigrateFn>, errors: &mut Errors) -> Option<Migration> {
+    let mut old: Option<Type> = None;
+    let mut global: Option<Ident> = None;
+    let mut migrations: Vec<EntityMigration> = Vec::new();
+    for f in fns {
+        let (from, span) = match &f {
+            MigrateFn::Global { function, old } => (old, function.span()),
+            MigrateFn::Entity { migration, old } => (old, migration.old.span()),
+        };
+        match &old {
+            Some(first) if first.to_token_stream().to_string() != from.to_token_stream().to_string() => {
+                errors.push(syn::Error::new(
+                    span,
+                    format!(
+                        "every #[migrate] function migrates from the schema before this one, `{}`; \
+                         older schemas migrate with their own",
+                        first.to_token_stream()
+                    ),
+                ));
+                continue;
+            }
+            Some(_) => {}
+            None => old = Some(from.clone()),
+        }
+        match f {
+            MigrateFn::Global { function, .. } if global.is_some() => errors.push(syn::Error::new(
+                function.span(),
+                "a schema has at most one #[migrate] function from the old schema's `ReadTx`; \
+                 migrate single entities with `fn(old: old_schema::Entity) -> orangedb::Result<Entity>`",
+            )),
+            MigrateFn::Global { function, .. } => global = Some(function),
+            MigrateFn::Entity { migration, .. } => {
+                if !entities.iter().any(|e| e.ident == migration.entity) {
+                    errors.push(syn::Error::new(
+                        migration.entity.span(),
+                        format!(
+                            "`{}` is not an #[entity] in this schema; entities the new schema drops \
+                             or renames are migrated by a #[migrate] function from the old schema's `ReadTx`",
+                            migration.entity
+                        ),
+                    ));
+                } else if migrations.iter().any(|m| m.entity == migration.entity) {
+                    errors.push(syn::Error::new(
+                        migration.function.span(),
+                        format!("{} already has a #[migrate] function", migration.entity),
+                    ));
+                } else {
+                    migrations.push(migration);
+                }
+            }
+        }
+    }
+    Some(Migration {
+        old: old?,
+        global,
+        entities: migrations,
+    })
+}
+
+fn migrate(attr: Attribute, f: &ItemFn) -> syn::Result<MigrateFn> {
+    let usage = "expected `fn name(old: old_schema::Entity) -> orangedb::Result<Entity>` for one entity, \
+                 or `fn name(old: &old_schema::ReadTx, new: &WriteTx) -> orangedb::Result<()>`";
     if !matches!(attr.meta, syn::Meta::Path(_)) {
         return Err(syn::Error::new(attr.span(), "#[migrate] takes no arguments"));
     }
-    let args: Vec<&FnArg> = f.sig.inputs.iter().collect();
-    let [FnArg::Typed(old), FnArg::Typed(_)] = args.as_slice() else {
-        return Err(syn::Error::new(f.sig.inputs.span(), usage));
-    };
-    let Type::Reference(old) = &*old.ty else {
-        return Err(syn::Error::new(old.ty.span(), usage));
-    };
-    if old.mutability.is_some() || !f.sig.generics.params.is_empty() {
-        return Err(syn::Error::new(f.sig.span(), usage));
+    if !f.sig.generics.params.is_empty() {
+        return Err(syn::Error::new(f.sig.generics.span(), usage));
     }
-    Ok(Migration {
-        function: f.sig.ident.clone(),
-        old: (*old.elem).clone(),
+    let args: Vec<&FnArg> = f.sig.inputs.iter().collect();
+    match args.as_slice() {
+        [FnArg::Typed(old), FnArg::Typed(_)] => {
+            let Type::Reference(old) = &*old.ty else {
+                return Err(syn::Error::new(old.ty.span(), usage));
+            };
+            if old.mutability.is_some() {
+                return Err(syn::Error::new(old.span(), usage));
+            }
+            Ok(MigrateFn::Global {
+                function: f.sig.ident.clone(),
+                old: (*old.elem).clone(),
+            })
+        }
+        [FnArg::Typed(old)] => entity_migration(f, &old.ty, usage),
+        _ => Err(syn::Error::new(f.sig.inputs.span(), usage)),
+    }
+}
+
+/// A `#[migrate]` function for one entity. The argument's path names the
+/// old schema, whose `ReadTx` the migration reads the old rows from.
+fn entity_migration(f: &ItemFn, old: &Type, usage: &str) -> syn::Result<MigrateFn> {
+    let Type::Path(syn::TypePath { qself: None, path }) = old else {
+        return Err(syn::Error::new(old.span(), usage));
+    };
+    let Some(last) = path.segments.last().filter(|_| path.segments.len() > 1) else {
+        return Err(syn::Error::new(
+            old.span(),
+            "name the old entity through its schema module, as in `v1::User`, \
+             so that the migration knows which schema it migrates from",
+        ));
+    };
+    if !last.arguments.is_none() {
+        return Err(syn::Error::new(old.span(), usage));
+    }
+    let entity = match &f.sig.output {
+        syn::ReturnType::Type(_, ty) => result_of(ty),
+        syn::ReturnType::Default => None,
+    };
+    let Some(entity) = entity else {
+        return Err(syn::Error::new(f.sig.output.span(), usage));
+    };
+    if entity != last.ident {
+        return Err(syn::Error::new(
+            entity.span(),
+            format!(
+                "a #[migrate] function for one entity returns the entity of the same name, `{}`; \
+                 renames are migrated by a #[migrate] function from the old schema's `ReadTx`",
+                last.ident
+            ),
+        ));
+    }
+    let mut read_tx = path.clone();
+    read_tx.segments.pop();
+    read_tx
+        .segments
+        .push(syn::PathSegment::from(Ident::new("ReadTx", last.ident.span())));
+    Ok(MigrateFn::Entity {
+        migration: EntityMigration {
+            function: f.sig.ident.clone(),
+            entity,
+            old: path.clone(),
+        },
+        old: Type::Path(syn::TypePath {
+            qself: None,
+            path: read_tx,
+        }),
     })
+}
+
+/// `E` of `Result<E>`, if `E` is a plain name.
+fn result_of(ty: &Type) -> Option<Ident> {
+    let Type::Path(syn::TypePath { qself: None, path }) = ty else {
+        return None;
+    };
+    let last = path.segments.last()?;
+    let PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    if last.ident != "Result" || args.args.len() != 1 {
+        return None;
+    }
+    let Some(GenericArgument::Type(Type::Path(syn::TypePath { qself: None, path }))) = args.args.first() else {
+        return None;
+    };
+    path.get_ident().cloned()
 }
 
 fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {

@@ -102,8 +102,9 @@ use syn::{Item, ItemMod, parse_macro_input};
 ///
 /// Each entity has a fingerprint of how its rows are stored and how they
 /// reference others, which the database records. Opening a database that stores a different
-/// fingerprint for an entity runs the schema's `#[migrate]` function, or
-/// fails with `Error::SchemaMismatch` if it has none:
+/// fingerprint for an entity runs the schema's `#[migrate]` functions, or
+/// fails with `Error::SchemaMismatch` if it has none. The usual kind
+/// migrates one entity that changed, a row at a time:
 ///
 /// ```ignore
 /// #[orangedb::schema]
@@ -111,11 +112,8 @@ use syn::{Item, ItemMod, parse_macro_input};
 ///     use super::v1;
 ///
 ///     #[migrate]
-///     fn from_v1(old: &v1::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
-///         for user in old.users().all()? {
-///             new.users().insert(&User { id: UserId(user.id.0), email: user.email, verified: false })?;
-///         }
-///         Ok(())
+///     fn user_from_v1(old: v1::User) -> orangedb::Result<User> {
+///         Ok(User { id: UserId(old.id.0), email: old.email, verified: false })
 ///     }
 ///
 ///     #[entity]
@@ -123,13 +121,24 @@ use syn::{Item, ItemMod, parse_macro_input};
 /// }
 /// ```
 ///
-/// The function reads the database as the old schema saw it and writes it
-/// at the new one, in a single transaction. Entities whose fingerprint
-/// didn't change are already there; the others start out empty, and their
-/// old tables are dropped afterwards, as are entities the new schema no
-/// longer declares. References are checked once the function returns, so
-/// rows can be written in any order. If the database is older still, the old
-/// schema's own `#[migrate]` function runs first.
+/// Every entity that changed needs one, from the old entity of the same name,
+/// and none that didn't change may have one: both are compile errors.
+///
+/// A schema can also have one function for the whole database,
+/// `fn(old: &v1::ReadTx, new: &WriteTx) -> orangedb::Result<()>`, which
+/// reads it as the old schema saw it and writes it at the new one. It is
+/// needed when an entity of the old schema is gone, and it migrates the
+/// changed entities that have no function of their own. Prefer the
+/// per-entity functions where they do the job: they don't load whole tables
+/// and the compiler checks that they cover every change. The per-entity
+/// functions run first.
+///
+/// It all happens in a single transaction. Entities whose fingerprint didn't
+/// change are already there; the others start out empty, and their old
+/// tables are dropped afterwards, as are entities the new schema no longer
+/// declares. References are checked once the migration is done, so rows can
+/// be written in any order. If the database is older still, the old schema's
+/// own `#[migrate]` functions run first.
 ///
 /// The database also records a catalog of each entity's layout (its tables,
 /// fields, references and indexes) and this module's source, which

@@ -175,7 +175,7 @@ A delete works out the whole cascade before it writes anything. If a
 | `#[index(name: Key = expr)]` | struct | An index of keys computed from each row, see [Query](#query). Options: `unique`, and `fingerprint = "label"`, to change when a function the expression calls changes what it returns. |
 | `#[embed]` / `#[orangedb::embed]` | struct or enum | A type entities can store in a field. `#[embed]` inside the schema module, `#[orangedb::embed]` anywhere else. |
 | `#[fingerprint = "label"]` | field | Declares the stored format of a field whose type has no fingerprint, e.g. one stored with `#[serde(with = ...)]`. Change the label when the format changes. |
-| `#[migrate]` | fn in the schema module | Migrates a database from the previous schema, see below. |
+| `#[migrate]` | fn in the schema module | Migrates one entity, or the whole database, from the previous schema, see [Fingerprints and migrations](#fingerprints-and-migrations). |
 
 ## Stored types
 
@@ -230,8 +230,9 @@ new unique index finds a duplicate, opening fails with `Error::Unique` and
 changes nothing.
 
 Opening a database that stores a different fingerprint runs the schema's
-`#[migrate]` function, which names the previous schema by its first argument.
-Keep the old schema module around for it:
+`#[migrate]` functions, which name the previous schema by their argument
+types. Keep the old schema module around for them. The usual kind migrates
+one entity, a row at a time:
 
 ```rust
 #[orangedb::schema]
@@ -249,15 +250,12 @@ pub mod v2 {
     use super::v1;
 
     #[migrate]
-    fn from_v1(old: &v1::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
-        for user in old.users().all()? {
-            let (first, last) = user.name.split_once(' ').unwrap_or((&user.name, ""));
-            new.users().insert(&User {
-                id: UserId(user.id.0),
-                name: Name { first: first.into(), last: last.into() },
-            })?;
-        }
-        Ok(())
+    fn user_from_v1(old: v1::User) -> orangedb::Result<User> {
+        let (first, last) = old.name.split_once(' ').unwrap_or((&old.name, ""));
+        Ok(User {
+            id: UserId(old.id.0),
+            name: Name { first: first.into(), last: last.into() },
+        })
     }
 
     #[embed]
@@ -277,19 +275,48 @@ pub mod v2 {
 let db = v2::Db::open("app.redb")?; // migrates a v1 file, opens a v2 one
 ```
 
-- `old` reads the database as the old schema left it; `new` writes it at the
-  new one. It all happens in one transaction: if the function returns an
-  error (for instance `Error::migration("...")`) or a constraint fails, the
-  database stays at the old schema.
+Every entity that changed needs one, named after it, from the old entity of
+the same name to the new one. It's a compile error to leave one out, or to
+write one for an entity that didn't change. Rows are read in pages and
+written one by one, so a migration doesn't hold a whole table in memory.
+
+Some migrations can't be done one row at a time: dropping or renaming an
+entity, or giving rows new ids that other entities' rows have to follow.
+For those, there's a function for the whole schema:
+
+```rust
+#[migrate]
+fn from_v1(old: &v1::ReadTx, new: &WriteTx) -> orangedb::Result<()> {
+    for draft in old.drafts().all()? {
+        new.notes().create(|id| Note { id, body: draft.body })?;
+    }
+    Ok(())
+}
+```
+
+It reads the whole database as the old schema left it and writes it at the
+new one. A schema has at most one, and it is required when an entity of the
+old schema is gone (one that just returns `Ok(())` drops it). With it,
+changed entities don't need functions of their own: the global function
+migrates whichever of them have none. Prefer the per-entity functions
+anyway. They say exactly what changed, they don't load whole tables like
+`all()` does, and the compiler checks that they cover every change. When a
+schema has both kinds, the per-entity functions run first, so the global
+function finds their rows already in `new`.
+
+- It all happens in one transaction: if a function returns an error (for
+  instance `Error::migration("...")`) or a constraint fails, the database
+  stays at the old schema.
 - Each entity's tables are named after its fingerprint, so entities that
-  didn't change are already there in `new`, and the changed ones start out
-  empty. Afterwards the old layouts' tables are dropped, along with entities
-  the new schema no longer declares. Auto-increment sequences carry over.
-- References are checked once the function returns, not on every write, so
-  rows can be written in any order, which matters for ids that change and
+  didn't change are already there, and the changed ones start out empty.
+  Afterwards the old layouts' tables are dropped, along with entities the
+  new schema no longer declares. Auto-increment sequences carry over.
+- References are checked once the migration is done, not on every write,
+  so rows can be written in any order, which matters for ids that change and
   for entities that reference themselves.
+- Entities the new schema adds start out empty and need no function.
 - Migrations chain: if the database is older than `v1`, `v1`'s own
-  `#[migrate]` function brings it to `v1` first. Each step commits on its own.
+  `#[migrate]` functions bring it to `v1` first. Each step commits on its own.
 - Without a `#[migrate]` function, or if no chain of them leads from the
   stored schema, opening fails with `Error::SchemaMismatch`.
 
@@ -297,8 +324,8 @@ Adding an entity needs no migration, and neither does opening a database
 with a schema that only declares some of its entities, as long as none of
 the ones it leaves out reference one it declares: deleting a row would skip
 their `on_delete` rules. Opening then fails with `Error::Undeclared`, unless
-a `#[migrate]` function drops the entity (one that just returns `Ok(())` will
-do, if nothing else changed).
+a global `#[migrate]` function drops the entity (one that just returns
+`Ok(())` will do, if nothing else changed).
 
 ## Inspecting a database
 

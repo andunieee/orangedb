@@ -5,11 +5,11 @@
 //! live in a private `__orangedb` submodule.
 
 use proc_macro2::{Literal, TokenStream};
-use quote::{format_ident, quote, quote_spanned};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{Ident, LitStr};
 
-use crate::parse::{Entity, Field, IdKind, Index, Indexed, OnDelete, Schema, Shape, snake_case};
+use crate::parse::{Entity, Field, IdKind, Index, Indexed, Migration, OnDelete, Schema, Shape, snake_case};
 
 pub fn expand(schema: &Schema, source: &str) -> TokenStream {
     let source = LitStr::new(source, proc_macro2::Span::call_site());
@@ -72,8 +72,16 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
     let migrate = match &schema.migration {
         None => quote!(Ok(false)),
         Some(m) => {
-            let function = &m.function;
             let old = &m.old;
+            let per_entity = m.entities.iter().map(|em| {
+                let function = &em.function;
+                let old_entity = &em.old;
+                let accessor = &schema.entity(&em.entity).accessor;
+                quote! {
+                    ::orangedb::__private::for_each_old::<#old_entity>(&old, |row| tx.#accessor().insert(&#function(row)?))?;
+                }
+            });
+            let global = m.global.iter();
             quote! {
                 type Old = #old;
                 type OldSchema = <Old as ::orangedb::__private::SchemaReadTx>::Schema;
@@ -82,7 +90,8 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
                 let tx = WriteTx { inner: db.begin_write()?, migrating: true };
                 let result = (|| -> ::orangedb::Result<()> {
                     <Self as ::orangedb::__private::Schema>::create_tables(&tx.inner)?;
-                    #function(&old, &tx)?;
+                    #( #per_entity )*
+                    #( #global(&old, &tx)?; )*
                     ::orangedb::__private::finish_migration::<OldSchema, Self>(&tx.inner)
                 })();
                 drop(old);
@@ -99,6 +108,8 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
             }
         }
     };
+    let migration_checks = schema.migration.as_ref().map(|m| migration_checks(schema, m));
+    let rows_consts: Vec<Ident> = entities.iter().map(rows_const).collect();
 
     quote! {
         #( #public )*
@@ -232,7 +243,13 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
             fn from_redb(inner: ::orangedb::redb::ReadTransaction) -> Self {
                 ReadTx { inner }
             }
+
+            fn redb(&self) -> &::orangedb::redb::ReadTransaction {
+                &self.inner
+            }
         }
+
+        #migration_checks
 
         impl ::orangedb::__private::Schema for Db {
             const ENTITIES: &'static [(&'static str, u64)] = &[
@@ -292,6 +309,12 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
                 }
             }
 
+            #(
+                impl rt::Rows for #names {
+                    const ROWS: rt::RowTable<#id_tys> = #rows_consts;
+                }
+            )*
+
             pub fn create_tables(tx: &WriteTransaction) -> Result<()> {
                 // Before creating any: the index tables missing from it
                 // are filled from the rows.
@@ -329,6 +352,82 @@ pub fn expand(schema: &Schema, source: &str) -> TokenStream {
 
             #( #internal )*
         }
+    }
+}
+
+/// Compile-time checks that the `#[migrate]` functions cover every way the
+/// schema differs from the old one: an entity that changed needs a function
+/// of its own or the global one, and an entity the schema drops needs the
+/// global one. An entity that didn't change can't have a function: its rows
+/// are already where the new schema reads them.
+fn migration_checks(schema: &Schema, m: &Migration) -> TokenStream {
+    let old = &m.old;
+    let old_module = {
+        let written = old.to_token_stream().to_string().replace(' ', "");
+        written.strip_suffix("::ReadTx").map(str::to_string).unwrap_or(written)
+    };
+    let unchanged = m.entities.iter().map(|em| {
+        let entity = &em.entity;
+        let old_entity = &em.old;
+        let message = LitStr::new(
+            &format!("{entity} didn't change since `{old_module}`, so it needs no #[migrate] function"),
+            em.function.span(),
+        );
+        quote_spanned! {em.function.span()=>
+            if <#old_entity as ::orangedb::Entity>::FINGERPRINT == <#entity as ::orangedb::Entity>::FINGERPRINT {
+                panic!(#message);
+            }
+        }
+    });
+    let changed = if m.global.is_some() {
+        Vec::new()
+    } else {
+        schema
+            .entities
+            .iter()
+            .filter(|e| !m.entities.iter().any(|em| em.entity == e.ident))
+            .map(|e| {
+                let entity = &e.ident;
+                let message = LitStr::new(
+                    &format!(
+                        "{entity} changed since `{old_module}`: migrate its rows with \
+                         `#[migrate] fn(old: {old_module}::{entity}) -> orangedb::Result<{entity}>`, \
+                         or the whole schema with `#[migrate] fn(old: &{old_module}::ReadTx, new: &WriteTx)`"
+                    ),
+                    entity.span(),
+                );
+                quote_spanned! {entity.span()=>
+                    if let Some(stored) = rt::fingerprint_of(OLD, stringify!(#entity))
+                        && stored != <#entity as ::orangedb::Entity>::FINGERPRINT
+                    {
+                        panic!(#message);
+                    }
+                }
+            })
+            .collect()
+    };
+    let removed = m.global.is_none().then(|| {
+        let span = m
+            .entities
+            .first()
+            .map_or(proc_macro2::Span::call_site(), |em| em.function.span());
+        let prefix = format!(" is in `{old_module}` but not in this schema: dropping it takes ");
+        let suffix =
+            format!("`#[migrate] fn(old: &{old_module}::ReadTx, new: &WriteTx)`, which can just return `Ok(())`");
+        quote_spanned! {span=>
+            if let Some(name) = rt::removed(OLD, <Db as rt::Schema>::ENTITIES) {
+                panic!("{}", rt::Message::new().push(name).push(#prefix).push(#suffix).as_str());
+            }
+        }
+    });
+    quote! {
+        const _: () = {
+            use ::orangedb::__private as rt;
+            const OLD: &[(&str, u64)] = <<#old as rt::SchemaReadTx>::Schema as rt::Schema>::ENTITIES;
+            #( #unchanged )*
+            #( #changed )*
+            #removed
+        };
     }
 }
 
