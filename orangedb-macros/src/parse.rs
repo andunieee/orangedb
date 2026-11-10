@@ -113,8 +113,12 @@ pub enum OnDelete {
     SetNull,
 }
 
-/// Parses the module, strips orangedb attributes from it in place and
-/// returns the schema they described.
+/// Parses the module and returns the schema the attributes describe.
+///
+/// The `#[entity]`, `#[id]`, `#[references]`, `#[unique]`, `#[index]`,
+/// `#[fingerprint]` and `#[embed]` attributes are left in place: a derive
+/// that `schema` adds declares them as helpers, so that editors can resolve
+/// them.
 pub fn schema(module: &mut ItemMod) -> syn::Result<Schema> {
     let Some((_, items)) = &mut module.content else {
         return Err(syn::Error::new(
@@ -128,7 +132,7 @@ pub fn schema(module: &mut ItemMod) -> syn::Result<Schema> {
     let mut errors = Errors::default();
     for item in items.iter_mut() {
         if let Item::Struct(s) = item
-            && let Some(attr) = take_attr(&mut s.attrs, "entity")
+            && let Some(attr) = find_attr(&s.attrs, "entity")
         {
             match entity(attr, s) {
                 Ok(e) => entities.push(e),
@@ -251,12 +255,12 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
     }
     for f in named.named.iter_mut() {
         let ident = f.ident.clone().expect("named field");
-        let id_attr = take_attr(&mut f.attrs, "id");
-        let ref_attr = take_attr(&mut f.attrs, "references");
-        let unique_attr = take_attr(&mut f.attrs, "unique");
-        let index_attr = take_attr(&mut f.attrs, "index");
+        let id_attr = find_attr(&f.attrs, "id");
+        let ref_attr = find_attr(&f.attrs, "references");
+        let unique_attr = find_attr(&f.attrs, "unique");
+        let index_attr = find_attr(&f.attrs, "index");
         let indexed = unique_attr.is_some() || index_attr.is_some();
-        match print::field(&mut fingerprint, f, &ident.to_string()) {
+        match print::field(&mut fingerprint, f, &ident.to_string(), false) {
             Ok(FieldKind::Skipped) if id_attr.is_some() || ref_attr.is_some() || indexed => {
                 errors.push(syn::Error::new(
                     ident.span(),
@@ -380,8 +384,9 @@ fn entity(attr: Attribute, s: &mut ItemStruct) -> syn::Result<Entity> {
             None
         }
     };
-    while let Some(attr) = take_attr(&mut s.attrs, "index") {
-        match struct_index(&attr) {
+    let struct_indexes: Vec<Attribute> = s.attrs.iter().filter(|a| a.path().is_ident("index")).cloned().collect();
+    for attr in &struct_indexes {
+        match struct_index(attr) {
             Ok(index) => indexes.push(index),
             Err(e) => errors.push(e),
         }
@@ -535,6 +540,12 @@ fn reference(attr: &Attribute) -> syn::Result<Reference> {
         }
         Ok(Reference { target, on_delete })
     })
+}
+
+/// The attribute as written, without removing it, so that the derive which
+/// declares it as a helper can leave it resolvable for editors.
+fn find_attr(attrs: &[Attribute], name: &str) -> Option<Attribute> {
+    attrs.iter().find(|a| a.path().is_ident(name)).cloned()
 }
 
 fn take_attr(attrs: &mut Vec<Attribute>, name: &str) -> Option<Attribute> {

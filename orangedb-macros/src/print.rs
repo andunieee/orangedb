@@ -45,9 +45,10 @@ pub enum FieldKind {
     Skipped,
 }
 
-/// Adds a field to `print` and strips its `#[fingerprint]` attribute.
-pub fn field(print: &mut Print, f: &mut Field, name: &str) -> syn::Result<FieldKind> {
-    let label = take_label(&mut f.attrs)?;
+/// Adds a field to `print` and strips its `#[fingerprint]` attribute when
+/// `strip` is set.
+pub fn field(print: &mut Print, f: &mut Field, name: &str, strip: bool) -> syn::Result<FieldKind> {
+    let label = take_label(&mut f.attrs, strip)?;
     let wire = serde_attrs(&f.attrs, label.is_some())?;
     print.str("field");
     print.str(name);
@@ -71,14 +72,14 @@ pub fn type_print(ty: &Type) -> TokenStream {
 }
 
 /// Adds every field of a struct or enum variant.
-pub fn fields(print: &mut Print, fields: &mut Fields) -> syn::Result<()> {
+pub fn fields(print: &mut Print, fields: &mut Fields, strip: bool) -> syn::Result<()> {
     let mut errors = Errors::default();
     match fields {
         Fields::Named(named) => {
             print.str("named");
             for f in named.named.iter_mut() {
                 let name = f.ident.as_ref().expect("named field").to_string();
-                if let Err(e) = field(print, f, &name) {
+                if let Err(e) = field(print, f, &name, strip) {
                     errors.push(e);
                 }
             }
@@ -86,7 +87,7 @@ pub fn fields(print: &mut Print, fields: &mut Fields) -> syn::Result<()> {
         Fields::Unnamed(unnamed) => {
             print.str("tuple");
             for (i, f) in unnamed.unnamed.iter_mut().enumerate() {
-                if let Err(e) = field(print, f, &i.to_string()) {
+                if let Err(e) = field(print, f, &i.to_string(), strip) {
                     errors.push(e);
                 }
             }
@@ -96,12 +97,12 @@ pub fn fields(print: &mut Print, fields: &mut Fields) -> syn::Result<()> {
     errors.finish()
 }
 
-/// `#[fingerprint = "..."]`, removed from the attributes.
-fn take_label(attrs: &mut Vec<Attribute>) -> syn::Result<Option<String>> {
+/// `#[fingerprint = "..."]`, removed from the attributes when `strip` is set.
+fn take_label(attrs: &mut Vec<Attribute>, strip: bool) -> syn::Result<Option<String>> {
     let Some(pos) = attrs.iter().position(|a| a.path().is_ident("fingerprint")) else {
         return Ok(None);
     };
-    let attr = attrs.remove(pos);
+    let attr = if strip { attrs.remove(pos) } else { attrs[pos].clone() };
     let usage = "expected #[fingerprint = \"...\"], a label that you change whenever the field's stored format changes";
     match &attr.meta {
         Meta::NameValue(nv) => match &nv.value {

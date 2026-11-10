@@ -9,12 +9,16 @@ use syn::{GenericParam, Item, parse_quote};
 use crate::print::{self, Errors, Print};
 
 /// Adds the serde derives to `item` and returns its `Fingerprint` impl.
-pub fn expand(item: &mut Item) -> syn::Result<TokenStream> {
+///
+/// `strip` removes the `#[fingerprint]` labels the fingerprint consumed: it
+/// is set for a standalone `#[orangedb::embed]`, but not inside a schema
+/// module, where a derive keeps them resolvable for editors.
+pub fn expand(item: &mut Item, strip: bool) -> syn::Result<TokenStream> {
     let (attrs, generics, ident, print) = match item {
         Item::Struct(s) => {
             let mut print = Print::new("struct");
             print.str(&print::serde_attrs(&s.attrs, false)?.text);
-            print::fields(&mut print, &mut s.fields)?;
+            print::fields(&mut print, &mut s.fields, strip)?;
             (&mut s.attrs, &mut s.generics, &s.ident, print)
         }
         Item::Enum(e) => {
@@ -26,7 +30,7 @@ pub fn expand(item: &mut Item) -> syn::Result<TokenStream> {
                 print.str(&v.ident.to_string());
                 let result = print::serde_attrs(&v.attrs, false).and_then(|wire| {
                     print.str(&wire.text);
-                    print::fields(&mut print, &mut v.fields)
+                    print::fields(&mut print, &mut v.fields, strip)
                 });
                 if let Err(err) = result {
                     errors.push(err);

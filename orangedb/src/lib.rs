@@ -75,6 +75,7 @@ pub mod __private {
     pub use crate::fingerprint::Fp;
     pub use crate::migrate::*;
     pub use crate::store::*;
+    pub use orangedb_macros::SchemaAttributes;
     pub use serde;
 
     /// Keeps [`Fingerprint`] to the types orangedb and its macros declare.
