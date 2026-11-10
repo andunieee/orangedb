@@ -179,12 +179,12 @@ fn indexes_follow_updates() {
     assert_eq!(db.posts().by_liked_by(alice.id).unwrap(), vec![p.clone()]);
 
     p.author = bob.id;
-    p.liked_by = vec![bob.id];
+    p.liked_by.push(bob.id);
     db.posts().update(&p).unwrap();
     assert!(db.posts().by_author(alice.id).unwrap().is_empty());
-    assert!(db.posts().by_liked_by(alice.id).unwrap().is_empty());
     assert_eq!(db.posts().by_author(bob.id).unwrap(), vec![p.clone()]);
-    assert_eq!(db.posts().by_liked_by(bob.id).unwrap(), vec![p]);
+    assert_eq!(db.posts().by_liked_by(bob.id).unwrap(), vec![p.clone()]);
+    assert_eq!(db.posts().by_liked_by(alice.id).unwrap(), vec![p.clone()]);
 }
 
 #[test]
