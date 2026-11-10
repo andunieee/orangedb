@@ -238,7 +238,7 @@ fn indexes_are_not_part_of_the_fingerprint() {
 
 #[test]
 fn opening_builds_a_new_index_from_the_rows() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("books.redb");
     seed(&path, &["Dune", "dune", "Emma"]);
     assert!(index_tables(&path).is_empty());
@@ -261,7 +261,7 @@ fn opening_builds_a_new_index_from_the_rows() {
 fn reopening_trusts_the_index_it_finds() {
     use orangedb::redb::MultimapTableDefinition;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("books.redb");
     seed(&path, &["Dune"]);
     drop(lower::Db::open(&path).unwrap());
@@ -284,7 +284,7 @@ fn reopening_trusts_the_index_it_finds() {
 
 #[test]
 fn a_changed_index_is_rebuilt() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("books.redb");
     seed(&path, &["Dune"]);
     drop(lower::Db::open(&path).unwrap());
@@ -321,7 +321,7 @@ fn a_changed_index_is_rebuilt() {
 
 #[test]
 fn a_unique_index_over_duplicates_fails_to_open() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("books.redb");
     seed(&path, &["Dune", "Emma", "DUNE"]);
     let before = table_names(&path);
@@ -358,7 +358,7 @@ fn a_unique_index_over_duplicates_fails_to_open() {
 /// duplicate in the last one is still found.
 #[test]
 fn a_rebuild_reads_every_page() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("books.redb");
     let titles: Vec<String> = (0..600).map(|i| format!("Book {i}")).collect();
     let mut seeded: Vec<&str> = titles.iter().map(String::as_str).collect();
@@ -372,7 +372,7 @@ fn a_rebuild_reads_every_page() {
     drop(db);
 
     // A fresh file whose only duplicate is the last row.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("books.redb");
     seeded.push("BOOK 0");
     seed(&path, &seeded);

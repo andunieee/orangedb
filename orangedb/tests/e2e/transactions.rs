@@ -1,6 +1,7 @@
 //! `Db::write` and `Db::read`: atomicity, isolation, custom error types,
 //! panics and concurrent writers.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use orangedb::Error;
@@ -126,6 +127,8 @@ backends!(crate::transactions::ledger =>
         assert_eq!(db.transfers().next_id().unwrap(), TransferId(1));
     }
 
+    // Wasm has no unwinding, so the panic aborts instead of unwinding.
+    #[cfg(not(target_arch = "wasm32"))]
     fn a_panic_rolls_back(db) {
         let a = open(db, "a", 1);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -194,6 +197,8 @@ backends!(crate::transactions::ledger =>
         assert!(matches!(err, BankError::Insufficient { .. }));
     }
 
+    // Wasm without threads has no `std::thread`.
+    #[cfg(not(target_arch = "wasm32"))]
     fn concurrent_writers(db) {
         let names: Vec<AccountName> = (0..4).map(|i| open(db, &format!("acct{i}"), 1_000)).collect();
         std::thread::scope(|s| {

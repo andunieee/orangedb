@@ -195,7 +195,7 @@ fn natural_keys_and_nullable_references() {
 
 #[test]
 fn indexes_are_not_part_of_the_schema() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("db.redb");
 
     {
@@ -248,7 +248,7 @@ fn indexes_are_not_part_of_the_schema() {
 
 #[test]
 fn schema_is_checked_on_open() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("db.redb");
 
     {
@@ -280,4 +280,14 @@ fn schema_is_checked_on_open() {
         v1::Db::open(&path).err().unwrap(),
         Error::SchemaMismatch { entity: "Team", .. }
     ));
+}
+
+/// A temporary directory under Cargo's target directory.
+///
+/// `tempfile::tempdir()` panics on wasm, where `std::env::temp_dir` is
+/// unsupported, so tests go through this instead.
+fn tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
 }

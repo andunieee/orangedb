@@ -18,7 +18,7 @@ fn alice() -> User {
 
 #[test]
 fn everything_survives_a_reopen() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("blog.redb");
 
     let (alice, bob, post, reply) = {
@@ -86,7 +86,7 @@ fn everything_survives_a_reopen() {
 
 #[test]
 fn schema_source_is_recorded_with_each_fingerprint() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("blog.redb");
 
     let db = blog::Db::open(&path).unwrap();
@@ -106,7 +106,7 @@ fn schema_source_is_recorded_with_each_fingerprint() {
 
 #[test]
 fn schema_source_of_a_macro_generated_module_is_expanded() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
 
     let db = shop::price_type::Db::open(&path).unwrap();
@@ -123,7 +123,7 @@ fn the_catalog_describes_every_table() {
     use orangedb::catalog::{IdKind, Indexed, OnDelete, Shape};
     use orangedb::redb::{MultimapTableHandle, TableHandle};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("blog.redb");
     let db = blog::Db::open(&path).unwrap();
     db.users().create(|id| User { id, ..alice() }).unwrap();
@@ -203,7 +203,7 @@ fn the_catalog_describes_every_table() {
 
 #[test]
 fn rolled_back_writes_are_not_persisted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("blog.redb");
     {
         let db = blog::Db::open(&path).unwrap();
@@ -223,7 +223,7 @@ fn rolled_back_writes_are_not_persisted() {
 #[test]
 fn wrapping_an_existing_redb_database() {
     const NOTES: TableDefinition<&str, &str> = TableDefinition::new("notes");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shared.redb");
 
     // A database with a table of its own...
@@ -258,7 +258,7 @@ fn wrapping_an_existing_redb_database() {
 
 #[test]
 fn opening_garbage_fails() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("not-a-db");
     std::fs::write(&path, vec![0xab; 8192]).unwrap();
     let err = blog::Db::open(&path).err().unwrap();
@@ -484,7 +484,7 @@ fn seed(path: &Path) {
 
 #[test]
 fn schema_changes_that_keep_the_layout_are_accepted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     seed(&path);
 
@@ -528,7 +528,7 @@ fn schema_changes_that_keep_the_layout_are_accepted() {
 
 #[test]
 fn dropping_a_referencing_entity_takes_a_migration() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     seed(&path);
 
@@ -545,7 +545,7 @@ fn dropping_a_referencing_entity_takes_a_migration() {
 
 #[test]
 fn renaming_a_referenced_id_field_migrates() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     seed(&path);
 
@@ -561,7 +561,7 @@ fn renaming_a_referenced_id_field_migrates() {
 
 #[test]
 fn schema_changes_that_break_the_layout_are_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     seed(&path);
 
@@ -617,7 +617,7 @@ fn schema_changes_that_break_the_layout_are_rejected() {
 
 #[test]
 fn every_open_checks_every_entity() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     seed(&path);
 

@@ -29,11 +29,21 @@ macro_rules! backends {
 
             #[test]
             fn file() {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::tempdir();
                 run(&schema::Db::open(dir.path().join("db.redb")).unwrap());
             }
         }
     )*};
+}
+
+/// A temporary directory under Cargo's target directory.
+///
+/// `tempfile::tempdir()` panics on wasm, where `std::env::temp_dir` is
+/// unsupported, so tests go through this instead.
+fn tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
 }
 
 mod blog;

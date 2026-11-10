@@ -147,7 +147,7 @@ pub fn index_tables(path: &Path) -> Vec<String> {
 
 #[test]
 fn a_migration_can_add_indexes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     seed(&path, &["lamp", "desk"], &[1, 1, 2]);
     assert!(index_tables(&path).is_empty());
@@ -192,7 +192,7 @@ fn a_migration_can_add_indexes() {
 
 #[test]
 fn adding_a_unique_index_over_duplicates_fails() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     seed(&path, &["lamp", "desk", "lamp"], &[]);
     let before = table_names(&path);
@@ -211,7 +211,7 @@ fn adding_a_unique_index_over_duplicates_fails() {
 
 #[test]
 fn adding_a_reference_over_dangling_values_fails() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     // Order 2 points at an item that was never there.
     seed(&path, &["lamp"], &[1, 7]);
@@ -230,7 +230,7 @@ fn adding_a_reference_over_dangling_values_fails() {
 
 #[test]
 fn a_migration_can_remove_indexes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     seed(&path, &["lamp", "desk"], &[1, 2]);
     indexed::Db::open(&path).unwrap();
@@ -267,7 +267,7 @@ fn a_migration_can_remove_indexes() {
 /// one last.
 #[test]
 fn the_reference_check_reads_every_page() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("shop.redb");
     let mut orders = vec![1; 600];
     orders.push(7);

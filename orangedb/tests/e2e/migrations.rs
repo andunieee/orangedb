@@ -262,7 +262,7 @@ fn tables_of(names: &[String], entity: &str, fingerprint: u64) -> usize {
 
 #[test]
 fn a_migration_rewrites_the_changed_entities() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("forum.redb");
     seed(&path);
 
@@ -322,7 +322,7 @@ fn a_migration_rewrites_the_changed_entities() {
 
 #[test]
 fn migrated_layouts_keep_their_source() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("forum.redb");
     seed(&path);
 
@@ -337,7 +337,7 @@ fn migrated_layouts_keep_their_source() {
 
 #[test]
 fn the_catalog_keeps_migrated_layouts() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("forum.redb");
     seed(&path);
 
@@ -376,7 +376,10 @@ fn the_catalog_keeps_migrated_layouts() {
 
 #[test]
 fn migrations_chain_and_run_once() {
-    let dir = tempfile::tempdir().unwrap();
+    // The wasm test harness runs every test on one thread, so the thread-local
+    // counter is shared by the whole binary there. Start this test from zero.
+    v2::RUNS.set(0);
+    let dir = crate::tempdir();
     let path = dir.path().join("forum.redb");
     seed(&path);
 
@@ -535,7 +538,7 @@ mod per_entity {
 
 #[test]
 fn per_entity_migrations_run_before_the_global_one() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("forum.redb");
     seed(&path);
 
@@ -551,7 +554,7 @@ fn per_entity_migrations_run_before_the_global_one() {
 
 #[test]
 fn a_failed_per_entity_migration_leaves_the_database_alone() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("forum.redb");
     seed(&path);
     let before = table_names(&path);
@@ -658,7 +661,7 @@ mod broken {
 
 #[test]
 fn a_failed_migration_leaves_the_database_alone() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("forum.redb");
     seed(&path);
     let before = table_names(&path);
@@ -693,7 +696,7 @@ fn a_failed_migration_leaves_the_database_alone() {
 
 #[test]
 fn a_database_from_elsewhere_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tempdir();
     let path = dir.path().join("forum.redb");
 
     // Neither v2 nor v1 (which v2 migrates from) matches this `User`.
