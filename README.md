@@ -11,9 +11,10 @@ reference's `on_delete` rule.
 
 ## Usage
 
-```toml
-[dependencies]
-orangedb = "0.1"
+Add the crate from [crates.io](https://crates.io/crates/orangedb):
+
+```sh
+cargo add orangedb
 ```
 
 ### Declare a schema
