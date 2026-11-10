@@ -24,6 +24,7 @@ mod v1 {
         #[references(Member, on_delete = set_null)]
         #[unique]
         pub mentor: Option<MemberId>,
+        pub title: String,
     }
 }
 
@@ -48,6 +49,37 @@ mod v1_changed {
         #[references(Member, on_delete = set_null)]
         #[unique]
         pub mentor: Option<MemberId>,
+        pub title: String,
+    }
+}
+
+/// The same tables as `v1`, with a per-field index and an arbitrary one
+/// added. Indexes aren't part of the fingerprint, so this opens a `v1`
+/// database without a migration and builds them from its rows.
+#[orangedb::schema]
+mod v1_indexed {
+    #[entity]
+    #[derive(Debug, Clone, PartialEq)]
+    #[index(slug_upper: String = |t| t.slug.0.to_uppercase())]
+    pub struct Team {
+        #[id(String)]
+        pub slug: TeamSlug,
+        #[unique]
+        pub domain: Option<String>,
+    }
+
+    #[entity]
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Member {
+        #[id(auto)]
+        pub id: MemberId,
+        #[references(Team, on_delete = set_null)]
+        pub team: Option<TeamSlug>,
+        #[references(Member, on_delete = set_null)]
+        #[unique]
+        pub mentor: Option<MemberId>,
+        #[index]
+        pub title: String,
     }
 }
 
@@ -86,10 +118,11 @@ mod v2 {
         #[references(Member, on_delete = set_null)]
         #[unique]
         pub mentor: Option<MemberId>,
+        pub title: String,
     }
 }
 
-use orangedb::Error;
+use orangedb::{Entity, Error};
 use v1::*;
 
 fn team(slug: &str, domain: Option<&str>) -> Team {
@@ -124,6 +157,7 @@ fn natural_keys_and_nullable_references() {
             id,
             team: Some(TeamSlug::new("core")),
             mentor: None,
+            title: "Lead".into(),
         })
         .unwrap();
     let junior = db
@@ -132,12 +166,14 @@ fn natural_keys_and_nullable_references() {
             id,
             team: Some(TeamSlug::new("core")),
             mentor: Some(lead.id),
+            title: "Junior".into(),
         })
         .unwrap();
     let err = db.members().create(|id| Member {
         id,
         team: None,
         mentor: Some(lead.id),
+        title: "Other".into(),
     });
     assert!(matches!(err, Err(Error::Unique { field: "mentor", .. })));
     assert_eq!(db.members().by_mentor(lead.id).unwrap(), Some(junior.clone()));
@@ -154,6 +190,59 @@ fn natural_keys_and_nullable_references() {
             mentor: None,
             ..junior
         }]
+    );
+}
+
+#[test]
+fn indexes_are_not_part_of_the_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.redb");
+
+    {
+        let db = v1::Db::open(&path).unwrap();
+        db.teams().insert(&team("core", Some("core.example.com"))).unwrap();
+        db.teams().insert(&team("infra", None)).unwrap();
+        let lead = db
+            .members()
+            .create(|id| Member {
+                id,
+                team: Some(TeamSlug::new("core")),
+                mentor: None,
+                title: "Lead".into(),
+            })
+            .unwrap();
+        db.members()
+            .create(|id| Member {
+                id,
+                team: Some(TeamSlug::new("infra")),
+                mentor: Some(lead.id),
+                title: "Junior".into(),
+            })
+            .unwrap();
+    }
+
+    // Neither a field index nor an arbitrary one changes the fingerprint.
+    assert_eq!(v1::Team::FINGERPRINT, v1_indexed::Team::FINGERPRINT);
+    assert_eq!(v1::Member::FINGERPRINT, v1_indexed::Member::FINGERPRINT);
+
+    // So `v1_indexed` opens v1's file and builds both from its rows.
+    let db = v1_indexed::Db::open(&path).unwrap();
+    assert_eq!(db.members().ids_by_title("Lead").unwrap(), [v1_indexed::MemberId(1)]);
+    assert_eq!(db.members().by_title("Junior").unwrap()[0].id, v1_indexed::MemberId(2));
+    assert_eq!(
+        db.members()
+            .range_by_title("A".to_string().."Z".to_string())
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        db.teams().ids_by_slug_upper("CORE").unwrap(),
+        [v1_indexed::TeamSlug::new("core")]
+    );
+    assert_eq!(
+        db.teams().by_slug_upper("INFRA").unwrap()[0].slug,
+        v1_indexed::TeamSlug::new("infra")
     );
 }
 
